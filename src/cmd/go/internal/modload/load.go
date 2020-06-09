@@ -6,29 +6,25 @@ package modload
 
 import (
 	"bytes"
+	"cmd/go/internal/base"
+	"cmd/go/internal/cfg"
+	"cmd/go/internal/imports"
+	"cmd/go/internal/modfetch"
+	"cmd/go/internal/mvs"
+	"cmd/go/internal/par"
+	"cmd/go/internal/search"
+	"cmd/go/internal/str"
 	"errors"
 	"fmt"
 	"go/build"
-	"io/ioutil"
 	"os"
 	"path"
 	pathpkg "path"
 	"path/filepath"
 	"sort"
 	"strings"
-	"sync"
 
-	"cmd/go/internal/base"
-	"cmd/go/internal/cfg"
-	"cmd/go/internal/imports"
-	"cmd/go/internal/modfetch"
-	"cmd/go/internal/modfile"
-	"cmd/go/internal/module"
-	"cmd/go/internal/mvs"
-	"cmd/go/internal/par"
-	"cmd/go/internal/search"
-	"cmd/go/internal/semver"
-	"cmd/go/internal/str"
+	"golang.org/x/mod/module"
 )
 
 // buildList is the list of modules to use for building packages.
@@ -51,37 +47,26 @@ var buildList []module.Version
 var loaded *loader
 
 // ImportPaths returns the set of packages matching the args (patterns),
-// adding modules to the build list as needed to satisfy new imports.
+// on the target platform. Modules may be added to the build list
+// to satisfy new imports.
 func ImportPaths(patterns []string) []*search.Match {
-	InitMod()
+	matches := ImportPathsQuiet(patterns, imports.Tags())
+	search.WarnUnmatched(matches)
+	return matches
+}
 
-	var matches []*search.Match
-	for _, pattern := range search.CleanPatterns(patterns) {
-		m := &search.Match{
-			Pattern: pattern,
-			Literal: !strings.Contains(pattern, "...") && !search.IsMetaPackage(pattern),
-		}
-		if m.Literal {
-			m.Pkgs = []string{pattern}
-		}
-		matches = append(matches, m)
-	}
-
-	fsDirs := make([][]string, len(matches))
-	loaded = newLoader()
-	updateMatches := func(iterating bool) {
-		for i, m := range matches {
+// ImportPathsQuiet is like ImportPaths but does not warn about patterns with
+// no matches. It also lets the caller specify a set of build tags to match
+// packages. The build tags should typically be imports.Tags() or
+// imports.AnyTags(); a nil map has no special meaning.
+func ImportPathsQuiet(patterns []string, tags map[string]bool) []*search.Match {
+	updateMatches := func(matches []*search.Match, iterating bool) {
+		for _, m := range matches {
 			switch {
-			case build.IsLocalImport(m.Pattern) || filepath.IsAbs(m.Pattern):
+			case m.IsLocal():
 				// Evaluate list of file system directories on first iteration.
-				if fsDirs[i] == nil {
-					var dirs []string
-					if m.Literal {
-						dirs = []string{m.Pattern}
-					} else {
-						dirs = search.MatchPackagesInFS(m.Pattern).Pkgs
-					}
-					fsDirs[i] = dirs
+				if m.Dirs == nil {
+					matchLocalDirs(m)
 				}
 
 				// Make a copy of the directory list and translate to import paths.
@@ -90,105 +75,87 @@ func ImportPaths(patterns []string) []*search.Match {
 				// from not being in the build list to being in it and back as
 				// the exact version of a particular module increases during
 				// the loader iterations.
-				m.Pkgs = str.StringList(fsDirs[i])
-				pkgs := m.Pkgs
 				m.Pkgs = m.Pkgs[:0]
-				for _, pkg := range pkgs {
-					dir := pkg
-					if !filepath.IsAbs(dir) {
-						dir = filepath.Join(cwd, pkg)
-					} else {
-						dir = filepath.Clean(dir)
-					}
+				for _, dir := range m.Dirs {
+					pkg, err := resolveLocalPackage(dir)
+					if err != nil {
+						if !m.IsLiteral() && (err == errPkgIsBuiltin || err == errPkgIsGorootSrc) {
+							continue // Don't include "builtin" or GOROOT/src in wildcard patterns.
+						}
 
-					// Note: The checks for @ here are just to avoid misinterpreting
-					// the module cache directories (formerly GOPATH/src/mod/foo@v1.5.2/bar).
-					// It's not strictly necessary but helpful to keep the checks.
-					if modRoot != "" && dir == modRoot {
-						pkg = Target.Path
-					} else if modRoot != "" && strings.HasPrefix(dir, modRoot+string(filepath.Separator)) && !strings.Contains(dir[len(modRoot):], "@") {
-						suffix := filepath.ToSlash(dir[len(modRoot):])
-						if strings.HasPrefix(suffix, "/vendor/") {
-							// TODO getmode vendor check
-							pkg = strings.TrimPrefix(suffix, "/vendor/")
-						} else if targetInGorootSrc && Target.Path == "std" {
-							// Don't add the prefix "std/" to packages in the "std" module.
-							// It's the one module path that isn't a prefix of its packages.
-							pkg = strings.TrimPrefix(suffix, "/")
-							if pkg == "builtin" {
-								// "builtin" is a pseudo-package with a real source file.
-								// It's not included in "std", so it shouldn't be included in
-								// "./..." within module "std" either.
-								continue
-							}
-						} else {
-							pkg = Target.Path + suffix
-						}
-					} else if sub := search.InDir(dir, cfg.GOROOTsrc); sub != "" && sub != "." && !strings.Contains(sub, "@") {
-						pkg = filepath.ToSlash(sub)
-					} else if path := pathInModuleCache(dir); path != "" {
-						pkg = path
-					} else {
-						pkg = ""
+						// If we're outside of a module, ensure that the failure mode
+						// indicates that.
+						ModRoot()
+
 						if !iterating {
-							ModRoot()
-							base.Errorf("go: directory %s outside available modules", base.ShortPath(dir))
+							m.AddError(err)
 						}
-					}
-					info, err := os.Stat(dir)
-					if err != nil || !info.IsDir() {
-						// If the directory is local but does not exist, don't return it
-						// while loader is iterating, since this would trigger a fetch.
-						// After loader is done iterating, we still need to return the
-						// path, so that "go list -e" produces valid output.
-						if iterating {
-							continue
-						}
+						continue
 					}
 					m.Pkgs = append(m.Pkgs, pkg)
 				}
 
-			case strings.Contains(m.Pattern, "..."):
-				m.Pkgs = matchPackages(m.Pattern, loaded.tags, true, buildList)
+			case m.IsLiteral():
+				m.Pkgs = []string{m.Pattern()}
 
-			case m.Pattern == "all":
+			case strings.Contains(m.Pattern(), "..."):
+				m.Errs = m.Errs[:0]
+				matchPackages(m, loaded.tags, includeStd, buildList)
+
+			case m.Pattern() == "all":
 				loaded.testAll = true
 				if iterating {
 					// Enumerate the packages in the main module.
 					// We'll load the dependencies as we find them.
-					m.Pkgs = matchPackages("...", loaded.tags, false, []module.Version{Target})
+					m.Errs = m.Errs[:0]
+					matchPackages(m, loaded.tags, omitStd, []module.Version{Target})
 				} else {
 					// Starting with the packages in the main module,
 					// enumerate the full list of "all".
 					m.Pkgs = loaded.computePatternAll(m.Pkgs)
 				}
 
-			case search.IsMetaPackage(m.Pattern): // std, cmd
-				if len(m.Pkgs) == 0 {
-					m.Pkgs = search.MatchPackages(m.Pattern).Pkgs
+			case m.Pattern() == "std" || m.Pattern() == "cmd":
+				if m.Pkgs == nil {
+					m.MatchPackages() // Locate the packages within GOROOT/src.
 				}
+
+			default:
+				panic(fmt.Sprintf("internal error: modload missing case for pattern %s", m.Pattern()))
 			}
 		}
 	}
 
+	InitMod()
+
+	var matches []*search.Match
+	for _, pattern := range search.CleanPatterns(patterns) {
+		matches = append(matches, search.NewMatch(pattern))
+	}
+
+	loaded = newLoader(tags)
 	loaded.load(func() []string {
 		var roots []string
-		updateMatches(true)
+		updateMatches(matches, true)
 		for _, m := range matches {
-			for _, pkg := range m.Pkgs {
-				roots = append(roots, pkg)
-			}
+			roots = append(roots, m.Pkgs...)
 		}
 		return roots
 	})
 
 	// One last pass to finalize wildcards.
-	updateMatches(false)
+	updateMatches(matches, false)
+	checkMultiplePaths()
+	WriteGoMod()
 
-	// A given module path may be used as itself or as a replacement for another
-	// module, but not both at the same time. Otherwise, the aliasing behavior is
-	// too subtle (see https://golang.org/issue/26607), and we don't want to
-	// commit to a specific behavior at this point.
+	return matches
+}
+
+// checkMultiplePaths verifies that a given module path is used as itself
+// or as a replacement for another module, but not both at the same time.
+//
+// (See https://golang.org/issue/26607 and https://golang.org/issue/34650.)
+func checkMultiplePaths() {
 	firstPath := make(map[module.Version]string, len(buildList))
 	for _, mod := range buildList {
 		src := mod
@@ -202,11 +169,140 @@ func ImportPaths(patterns []string) []*search.Match {
 		}
 	}
 	base.ExitIfErrors()
-	WriteGoMod()
-
-	search.WarnUnmatched(matches)
-	return matches
 }
+
+// matchLocalDirs is like m.MatchDirs, but tries to avoid scanning directories
+// outside of the standard library and active modules.
+func matchLocalDirs(m *search.Match) {
+	if !m.IsLocal() {
+		panic(fmt.Sprintf("internal error: resolveLocalDirs on non-local pattern %s", m.Pattern()))
+	}
+
+	if i := strings.Index(m.Pattern(), "..."); i >= 0 {
+		// The pattern is local, but it is a wildcard. Its packages will
+		// only resolve to paths if they are inside of the standard
+		// library, the main module, or some dependency of the main
+		// module. Verify that before we walk the filesystem: a filesystem
+		// walk in a directory like /var or /etc can be very expensive!
+		dir := filepath.Dir(filepath.Clean(m.Pattern()[:i+3]))
+		absDir := dir
+		if !filepath.IsAbs(dir) {
+			absDir = filepath.Join(base.Cwd, dir)
+		}
+		if search.InDir(absDir, cfg.GOROOTsrc) == "" && search.InDir(absDir, ModRoot()) == "" && pathInModuleCache(absDir) == "" {
+			m.Dirs = []string{}
+			m.AddError(fmt.Errorf("directory prefix %s outside available modules", base.ShortPath(absDir)))
+			return
+		}
+	}
+
+	m.MatchDirs()
+}
+
+// resolveLocalPackage resolves a filesystem path to a package path.
+func resolveLocalPackage(dir string) (string, error) {
+	var absDir string
+	if filepath.IsAbs(dir) {
+		absDir = filepath.Clean(dir)
+	} else {
+		absDir = filepath.Join(base.Cwd, dir)
+	}
+
+	bp, err := cfg.BuildContext.ImportDir(absDir, 0)
+	if err != nil && (bp == nil || len(bp.IgnoredGoFiles) == 0) {
+		// golang.org/issue/32917: We should resolve a relative path to a
+		// package path only if the relative path actually contains the code
+		// for that package.
+		//
+		// If the named directory does not exist or contains no Go files,
+		// the package does not exist.
+		// Other errors may affect package loading, but not resolution.
+		if _, err := os.Stat(absDir); err != nil {
+			if os.IsNotExist(err) {
+				// Canonicalize OS-specific errors to errDirectoryNotFound so that error
+				// messages will be easier for users to search for.
+				return "", &os.PathError{Op: "stat", Path: absDir, Err: errDirectoryNotFound}
+			}
+			return "", err
+		}
+		if _, noGo := err.(*build.NoGoError); noGo {
+			// A directory that does not contain any Go source files — even ignored
+			// ones! — is not a Go package, and we can't resolve it to a package
+			// path because that path could plausibly be provided by some other
+			// module.
+			//
+			// Any other error indicates that the package “exists” (at least in the
+			// sense that it cannot exist in any other module), but has some other
+			// problem (such as a syntax error).
+			return "", err
+		}
+	}
+
+	if modRoot != "" && absDir == modRoot {
+		if absDir == cfg.GOROOTsrc {
+			return "", errPkgIsGorootSrc
+		}
+		return targetPrefix, nil
+	}
+
+	// Note: The checks for @ here are just to avoid misinterpreting
+	// the module cache directories (formerly GOPATH/src/mod/foo@v1.5.2/bar).
+	// It's not strictly necessary but helpful to keep the checks.
+	if modRoot != "" && strings.HasPrefix(absDir, modRoot+string(filepath.Separator)) && !strings.Contains(absDir[len(modRoot):], "@") {
+		suffix := filepath.ToSlash(absDir[len(modRoot):])
+		if strings.HasPrefix(suffix, "/vendor/") {
+			if cfg.BuildMod != "vendor" {
+				return "", fmt.Errorf("without -mod=vendor, directory %s has no package path", absDir)
+			}
+
+			readVendorList()
+			pkg := strings.TrimPrefix(suffix, "/vendor/")
+			if _, ok := vendorPkgModule[pkg]; !ok {
+				return "", fmt.Errorf("directory %s is not a package listed in vendor/modules.txt", absDir)
+			}
+			return pkg, nil
+		}
+
+		if targetPrefix == "" {
+			pkg := strings.TrimPrefix(suffix, "/")
+			if pkg == "builtin" {
+				// "builtin" is a pseudo-package with a real source file.
+				// It's not included in "std", so it shouldn't resolve from "."
+				// within module "std" either.
+				return "", errPkgIsBuiltin
+			}
+			return pkg, nil
+		}
+
+		pkg := targetPrefix + suffix
+		if _, ok, err := dirInModule(pkg, targetPrefix, modRoot, true); err != nil {
+			return "", err
+		} else if !ok {
+			return "", &PackageNotInModuleError{Mod: Target, Pattern: pkg}
+		}
+		return pkg, nil
+	}
+
+	if sub := search.InDir(absDir, cfg.GOROOTsrc); sub != "" && sub != "." && !strings.Contains(sub, "@") {
+		pkg := filepath.ToSlash(sub)
+		if pkg == "builtin" {
+			return "", errPkgIsBuiltin
+		}
+		return pkg, nil
+	}
+
+	pkg := pathInModuleCache(absDir)
+	if pkg == "" {
+		return "", fmt.Errorf("directory %s outside available modules", base.ShortPath(absDir))
+	}
+	return pkg, nil
+}
+
+var (
+	errDirectoryNotFound = errors.New("directory not found")
+	errPkgIsGorootSrc    = errors.New("GOROOT/src is not an importable package")
+	errPkgIsBuiltin      = errors.New(`"builtin" is a pseudo-package, not an importable package`)
+)
 
 // pathInModuleCache returns the import path of the directory dir,
 // if dir is in the module cache copy of a module in our build list.
@@ -237,27 +333,18 @@ func pathInModuleCache(dir string) string {
 	return ""
 }
 
-// warnPattern returns list, the result of matching pattern,
-// but if list is empty then first it prints a warning about
-// the pattern not matching any packages.
-func warnPattern(pattern string, list []string) []string {
-	if len(list) == 0 {
-		fmt.Fprintf(os.Stderr, "warning: %q matched no packages\n", pattern)
-	}
-	return list
-}
-
 // ImportFromFiles adds modules to the build list as needed
 // to satisfy the imports in the named Go source files.
 func ImportFromFiles(gofiles []string) {
 	InitMod()
 
-	imports, testImports, err := imports.ScanFiles(gofiles, imports.Tags())
+	tags := imports.Tags()
+	imports, testImports, err := imports.ScanFiles(gofiles, tags)
 	if err != nil {
 		base.Fatalf("go: %v", err)
 	}
 
-	loaded = newLoader()
+	loaded = newLoader(tags)
 	loaded.load(func() []string {
 		var roots []string
 		roots = append(roots, imports...)
@@ -275,7 +362,7 @@ func DirImportPath(dir string) string {
 	}
 
 	if !filepath.IsAbs(dir) {
-		dir = filepath.Join(cwd, dir)
+		dir = filepath.Join(base.Cwd, dir)
 	} else {
 		dir = filepath.Clean(dir)
 	}
@@ -306,7 +393,7 @@ func LoadBuildList() []module.Version {
 }
 
 func ReloadBuildList() []module.Version {
-	loaded = newLoader()
+	loaded = newLoader(imports.Tags())
 	loaded.load(func() []string { return nil })
 	return buildList
 }
@@ -332,36 +419,43 @@ func LoadVendor() []string {
 func loadAll(testAll bool) []string {
 	InitMod()
 
-	loaded = newLoader()
+	loaded = newLoader(imports.AnyTags())
 	loaded.isALL = true
-	loaded.tags = anyTags
 	loaded.testAll = testAll
 	if !testAll {
 		loaded.testRoots = true
 	}
 	all := TargetPackages("...")
-	loaded.load(func() []string { return all })
+	loaded.load(func() []string { return all.Pkgs })
+	checkMultiplePaths()
 	WriteGoMod()
 
 	var paths []string
 	for _, pkg := range loaded.pkgs {
-		if e, ok := pkg.err.(*ImportMissingError); ok && e.Module.Path == "" {
-			continue // Package doesn't actually exist.
+		if pkg.err != nil {
+			base.Errorf("%s: %v", pkg.stackText(), pkg.err)
+			continue
 		}
 		paths = append(paths, pkg.path)
 	}
+	for _, err := range all.Errs {
+		base.Errorf("%v", err)
+	}
+	base.ExitIfErrors()
 	return paths
 }
-
-// anyTags is a special tags map that satisfies nearly all build tag expressions.
-// Only "ignore" and malformed build tag requirements are considered false.
-var anyTags = map[string]bool{"*": true}
 
 // TargetPackages returns the list of packages in the target (top-level) module
 // matching pattern, which may be relative to the working directory, under all
 // build tag settings.
-func TargetPackages(pattern string) []string {
-	return matchPackages(pattern, anyTags, false, []module.Version{Target})
+func TargetPackages(pattern string) *search.Match {
+	// TargetPackages is relative to the main module, so ensure that the main
+	// module is a thing that can contain packages.
+	ModRoot()
+
+	m := search.NewMatch(pattern)
+	matchPackages(m, imports.AnyTags(), omitStd, []module.Version{Target})
+	return m
 }
 
 // BuildList returns the module build list,
@@ -377,6 +471,37 @@ func BuildList() []module.Version {
 // SetBuildList does not retain a reference to the original list.
 func SetBuildList(list []module.Version) {
 	buildList = append([]module.Version{}, list...)
+}
+
+// TidyBuildList trims the build list to the minimal requirements needed to
+// retain the same versions of all packages from the preceding Load* or
+// ImportPaths* call.
+func TidyBuildList() {
+	used := map[module.Version]bool{Target: true}
+	for _, pkg := range loaded.pkgs {
+		used[pkg.mod] = true
+	}
+
+	keep := []module.Version{Target}
+	var direct []string
+	for _, m := range buildList[1:] {
+		if used[m] {
+			keep = append(keep, m)
+			if loaded.direct[m.Path] {
+				direct = append(direct, m.Path)
+			}
+		} else if cfg.BuildV {
+			if _, ok := index.require[m]; ok {
+				fmt.Fprintf(os.Stderr, "unused %s\n", m.Path)
+			}
+		}
+	}
+
+	min, err := mvs.Req(Target, direct, &mvsReqs{buildList: keep})
+	if err != nil {
+		base.Fatalf("go: %v", err)
+	}
+	buildList = append([]module.Version{Target}, min...)
 }
 
 // ImportMap returns the actual package import path
@@ -408,6 +533,29 @@ func PackageModule(path string) module.Version {
 		return module.Version{}
 	}
 	return pkg.mod
+}
+
+// PackageImports returns the imports for the package named by the import path.
+// Test imports will be returned as well if tests were loaded for the package
+// (i.e., if "all" was loaded or if LoadTests was set and the path was matched
+// by a command line argument). PackageImports will return nil for
+// unknown package paths.
+func PackageImports(path string) (imports, testImports []string) {
+	pkg, ok := loaded.pkgCache.Get(path).(*loadPkg)
+	if !ok {
+		return nil, nil
+	}
+	imports = make([]string, len(pkg.imports))
+	for i, p := range pkg.imports {
+		imports[i] = p.path
+	}
+	if pkg.test != nil {
+		testImports = make([]string, len(pkg.test.imports))
+		for i, p := range pkg.test.imports {
+			testImports[i] = p.path
+		}
+	}
+	return imports, testImports
 }
 
 // ModuleUsedDirectly reports whether the main module directly imports
@@ -481,9 +629,9 @@ type loader struct {
 // LoadTests controls whether the loaders load tests of the root packages.
 var LoadTests bool
 
-func newLoader() *loader {
+func newLoader(tags map[string]bool) *loader {
 	ld := new(loader)
-	ld.tags = imports.Tags()
+	ld.tags = tags
 	ld.testRoots = LoadTests
 
 	// Inside the "std" and "cmd" modules, we prefer to use the vendor directory
@@ -552,6 +700,7 @@ func (ld *loader) load(roots func() []string) {
 				if err.newMissingVersion != "" {
 					base.Fatalf("go: %s: package provided by %s at latest version %s but not at required version %s", pkg.stackText(), err.Module.Path, err.Module.Version, err.newMissingVersion)
 				}
+				fmt.Fprintf(os.Stderr, "go: found %s in %s %s\n", pkg.path, err.Module.Path, err.Module.Version)
 				if added[pkg.path] {
 					base.Fatalf("go: %s: looping trying to add package", pkg.stackText())
 				}
@@ -657,7 +806,7 @@ func (ld *loader) doPkg(item interface{}) {
 			// Leave for error during load.
 			return
 		}
-		if build.IsLocalImport(pkg.path) {
+		if build.IsLocalImport(pkg.path) || filepath.IsAbs(pkg.path) {
 			// Leave for error during load.
 			// (Module mode does not allow local imports.)
 			return
@@ -887,270 +1036,4 @@ func WhyDepth(path string) int {
 		n++
 	}
 	return n
-}
-
-// Replacement returns the replacement for mod, if any, from go.mod.
-// If there is no replacement for mod, Replacement returns
-// a module.Version with Path == "".
-func Replacement(mod module.Version) module.Version {
-	if modFile == nil {
-		// Happens during testing and if invoking 'go get' or 'go list' outside a module.
-		return module.Version{}
-	}
-
-	var found *modfile.Replace
-	for _, r := range modFile.Replace {
-		if r.Old.Path == mod.Path && (r.Old.Version == "" || r.Old.Version == mod.Version) {
-			found = r // keep going
-		}
-	}
-	if found == nil {
-		return module.Version{}
-	}
-	return found.New
-}
-
-// mvsReqs implements mvs.Reqs for module semantic versions,
-// with any exclusions or replacements applied internally.
-type mvsReqs struct {
-	buildList []module.Version
-	cache     par.Cache
-	versions  sync.Map
-}
-
-// Reqs returns the current module requirement graph.
-// Future calls to SetBuildList do not affect the operation
-// of the returned Reqs.
-func Reqs() mvs.Reqs {
-	r := &mvsReqs{
-		buildList: buildList,
-	}
-	return r
-}
-
-func (r *mvsReqs) Required(mod module.Version) ([]module.Version, error) {
-	type cached struct {
-		list []module.Version
-		err  error
-	}
-
-	c := r.cache.Do(mod, func() interface{} {
-		list, err := r.required(mod)
-		if err != nil {
-			return cached{nil, err}
-		}
-		for i, mv := range list {
-			for excluded[mv] {
-				mv1, err := r.next(mv)
-				if err != nil {
-					return cached{nil, err}
-				}
-				if mv1.Version == "none" {
-					return cached{nil, fmt.Errorf("%s(%s) depends on excluded %s(%s) with no newer version available", mod.Path, mod.Version, mv.Path, mv.Version)}
-				}
-				mv = mv1
-			}
-			list[i] = mv
-		}
-
-		return cached{list, nil}
-	}).(cached)
-
-	return c.list, c.err
-}
-
-var vendorOnce sync.Once
-
-var (
-	vendorList []module.Version
-	vendorMap  map[string]module.Version
-)
-
-// readVendorList reads the list of vendored modules from vendor/modules.txt.
-func readVendorList() {
-	vendorOnce.Do(func() {
-		vendorList = nil
-		vendorMap = make(map[string]module.Version)
-		data, _ := ioutil.ReadFile(filepath.Join(ModRoot(), "vendor/modules.txt"))
-		var m module.Version
-		for _, line := range strings.Split(string(data), "\n") {
-			if strings.HasPrefix(line, "# ") {
-				f := strings.Fields(line)
-				m = module.Version{}
-				if len(f) == 3 && semver.IsValid(f[2]) {
-					m = module.Version{Path: f[1], Version: f[2]}
-					vendorList = append(vendorList, m)
-				}
-			} else if m.Path != "" {
-				f := strings.Fields(line)
-				if len(f) == 1 {
-					vendorMap[f[0]] = m
-				}
-			}
-		}
-	})
-}
-
-func (r *mvsReqs) modFileToList(f *modfile.File) []module.Version {
-	list := make([]module.Version, 0, len(f.Require))
-	for _, r := range f.Require {
-		list = append(list, r.Mod)
-	}
-	return list
-}
-
-// required returns a unique copy of the requirements of mod.
-func (r *mvsReqs) required(mod module.Version) ([]module.Version, error) {
-	if mod == Target {
-		if modFile != nil && modFile.Go != nil {
-			r.versions.LoadOrStore(mod, modFile.Go.Version)
-		}
-		return append([]module.Version(nil), r.buildList[1:]...), nil
-	}
-
-	if cfg.BuildMod == "vendor" {
-		// For every module other than the target,
-		// return the full list of modules from modules.txt.
-		readVendorList()
-		return append([]module.Version(nil), vendorList...), nil
-	}
-
-	if targetInGorootSrc {
-		// When inside "std" or "cmd", only fetch and read go.mod files if we're
-		// explicitly running a command that can change the module graph. If we have
-		// to resolve a new dependency, we might pick the wrong version, but 'go mod
-		// tidy' will fix it — and new standard-library dependencies should be rare
-		// anyway.
-		//
-		// TODO(golang.org/issue/30240): Drop this special-case.
-		if cfg.CmdName != "get" && !strings.HasPrefix(cfg.CmdName, "mod ") {
-			return nil, nil
-		}
-	}
-
-	origPath := mod.Path
-	if repl := Replacement(mod); repl.Path != "" {
-		if repl.Version == "" {
-			// TODO: need to slip the new version into the tags list etc.
-			dir := repl.Path
-			if !filepath.IsAbs(dir) {
-				dir = filepath.Join(ModRoot(), dir)
-			}
-			gomod := filepath.Join(dir, "go.mod")
-			data, err := ioutil.ReadFile(gomod)
-			if err != nil {
-				return nil, fmt.Errorf("parsing %s: %v", base.ShortPath(gomod), err)
-			}
-			f, err := modfile.ParseLax(gomod, data, nil)
-			if err != nil {
-				return nil, fmt.Errorf("parsing %s: %v", base.ShortPath(gomod), err)
-			}
-			if f.Go != nil {
-				r.versions.LoadOrStore(mod, f.Go.Version)
-			}
-			return r.modFileToList(f), nil
-		}
-		mod = repl
-	}
-
-	if mod.Version == "none" {
-		return nil, nil
-	}
-
-	if !semver.IsValid(mod.Version) {
-		// Disallow the broader queries supported by fetch.Lookup.
-		base.Fatalf("go: internal error: %s@%s: unexpected invalid semantic version", mod.Path, mod.Version)
-	}
-
-	data, err := modfetch.GoMod(mod.Path, mod.Version)
-	if err != nil {
-		return nil, fmt.Errorf("%s@%s: %v", mod.Path, mod.Version, err)
-	}
-	f, err := modfile.ParseLax("go.mod", data, nil)
-	if err != nil {
-		return nil, fmt.Errorf("%s@%s: parsing go.mod: %v", mod.Path, mod.Version, err)
-	}
-
-	if f.Module == nil {
-		return nil, fmt.Errorf("%s@%s: parsing go.mod: missing module line", mod.Path, mod.Version)
-	}
-	if mpath := f.Module.Mod.Path; mpath != origPath && mpath != mod.Path {
-		return nil, fmt.Errorf("%s@%s: parsing go.mod: unexpected module path %q", mod.Path, mod.Version, mpath)
-	}
-	if f.Go != nil {
-		r.versions.LoadOrStore(mod, f.Go.Version)
-	}
-
-	return r.modFileToList(f), nil
-}
-
-func (*mvsReqs) Max(v1, v2 string) string {
-	if v1 != "" && semver.Compare(v1, v2) == -1 {
-		return v2
-	}
-	return v1
-}
-
-// Upgrade is a no-op, here to implement mvs.Reqs.
-// The upgrade logic for go get -u is in ../modget/get.go.
-func (*mvsReqs) Upgrade(m module.Version) (module.Version, error) {
-	return m, nil
-}
-
-func versions(path string) ([]string, error) {
-	// Note: modfetch.Lookup and repo.Versions are cached,
-	// so there's no need for us to add extra caching here.
-	repo, err := modfetch.Lookup(path)
-	if err != nil {
-		return nil, err
-	}
-	return repo.Versions("")
-}
-
-// Previous returns the tagged version of m.Path immediately prior to
-// m.Version, or version "none" if no prior version is tagged.
-func (*mvsReqs) Previous(m module.Version) (module.Version, error) {
-	list, err := versions(m.Path)
-	if err != nil {
-		return module.Version{}, err
-	}
-	i := sort.Search(len(list), func(i int) bool { return semver.Compare(list[i], m.Version) >= 0 })
-	if i > 0 {
-		return module.Version{Path: m.Path, Version: list[i-1]}, nil
-	}
-	return module.Version{Path: m.Path, Version: "none"}, nil
-}
-
-// next returns the next version of m.Path after m.Version.
-// It is only used by the exclusion processing in the Required method,
-// not called directly by MVS.
-func (*mvsReqs) next(m module.Version) (module.Version, error) {
-	list, err := versions(m.Path)
-	if err != nil {
-		return module.Version{}, err
-	}
-	i := sort.Search(len(list), func(i int) bool { return semver.Compare(list[i], m.Version) > 0 })
-	if i < len(list) {
-		return module.Version{Path: m.Path, Version: list[i]}, nil
-	}
-	return module.Version{Path: m.Path, Version: "none"}, nil
-}
-
-func fetch(mod module.Version) (dir string, isLocal bool, err error) {
-	if mod == Target {
-		return ModRoot(), true, nil
-	}
-	if r := Replacement(mod); r.Path != "" {
-		if r.Version == "" {
-			dir = r.Path
-			if !filepath.IsAbs(dir) {
-				dir = filepath.Join(ModRoot(), dir)
-			}
-			return dir, true, nil
-		}
-		mod = r
-	}
-
-	dir, err = modfetch.Download(mod)
-	return dir, false, err
 }

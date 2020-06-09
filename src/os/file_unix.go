@@ -2,7 +2,7 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-// +build aix darwin dragonfly freebsd js,wasm linux nacl netbsd openbsd solaris
+// +build aix darwin dragonfly freebsd js,wasm linux netbsd openbsd solaris
 
 package os
 
@@ -27,13 +27,17 @@ func rename(oldname, newname string) error {
 		// At this point we've determined the newname is bad.
 		// But just in case oldname is also bad, prioritize returning
 		// the oldname error because that's what we did historically.
-		if _, err := Lstat(oldname); err != nil {
+		// However, if the old name and new name are not the same, yet
+		// they refer to the same file, it implies a case-only
+		// rename on a case-insensitive filesystem, which is ok.
+		if ofi, err := Lstat(oldname); err != nil {
 			if pe, ok := err.(*PathError); ok {
 				err = pe.Err
 			}
 			return &LinkError{"rename", oldname, newname, err}
+		} else if newname == oldname || !SameFile(fi, ofi) {
+			return &LinkError{"rename", oldname, newname, syscall.EEXIST}
 		}
-		return &LinkError{"rename", oldname, newname, syscall.EEXIST}
 	}
 	err = syscall.Rename(oldname, newname)
 	if err != nil {
@@ -198,10 +202,8 @@ func openFileNolog(name string, flag int, perm FileMode) (*File, error) {
 			break
 		}
 
-		// On OS X, sigaction(2) doesn't guarantee that SA_RESTART will cause
-		// open(2) to be restarted for regular files. This is easy to reproduce on
-		// fuse file systems (see https://golang.org/issue/11180).
-		if runtime.GOOS == "darwin" && e == syscall.EINTR {
+		// We have to check EINTR here, per issues 11180 and 39237.
+		if e == syscall.EINTR {
 			continue
 		}
 
@@ -220,16 +222,6 @@ func openFileNolog(name string, flag int, perm FileMode) (*File, error) {
 	}
 
 	return newFile(uintptr(r), name, kindOpenFile), nil
-}
-
-// Close closes the File, rendering it unusable for I/O.
-// On files that support SetDeadline, any pending I/O operations will
-// be canceled and return immediately with an error.
-func (f *File) Close() error {
-	if f == nil {
-		return ErrInvalid
-	}
-	return f.file.close()
 }
 
 func (file *file) close() error {
@@ -252,44 +244,17 @@ func (file *file) close() error {
 	return err
 }
 
-// read reads up to len(b) bytes from the File.
-// It returns the number of bytes read and an error, if any.
-func (f *File) read(b []byte) (n int, err error) {
-	n, err = f.pfd.Read(b)
-	runtime.KeepAlive(f)
-	return n, err
-}
-
-// pread reads len(b) bytes from the File starting at byte offset off.
-// It returns the number of bytes read and the error, if any.
-// EOF is signaled by a zero count with err set to nil.
-func (f *File) pread(b []byte, off int64) (n int, err error) {
-	n, err = f.pfd.Pread(b, off)
-	runtime.KeepAlive(f)
-	return n, err
-}
-
-// write writes len(b) bytes to the File.
-// It returns the number of bytes written and an error, if any.
-func (f *File) write(b []byte) (n int, err error) {
-	n, err = f.pfd.Write(b)
-	runtime.KeepAlive(f)
-	return n, err
-}
-
-// pwrite writes len(b) bytes to the File starting at byte offset off.
-// It returns the number of bytes written and an error, if any.
-func (f *File) pwrite(b []byte, off int64) (n int, err error) {
-	n, err = f.pfd.Pwrite(b, off)
-	runtime.KeepAlive(f)
-	return n, err
-}
-
 // seek sets the offset for the next Read or Write on file to offset, interpreted
 // according to whence: 0 means relative to the origin of the file, 1 means
 // relative to the current offset, and 2 means relative to the end.
 // It returns the new offset and an error, if any.
 func (f *File) seek(offset int64, whence int) (ret int64, err error) {
+	if f.dirinfo != nil {
+		// Free cached dirinfo, so we allocate a new one if we
+		// access this file as a directory again. See #35767 and #37161.
+		f.dirinfo.close()
+		f.dirinfo = nil
+	}
 	ret, err = f.pfd.Seek(offset, whence)
 	runtime.KeepAlive(f)
 	return ret, err

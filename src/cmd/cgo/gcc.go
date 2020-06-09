@@ -23,7 +23,6 @@ import (
 	"internal/xcoff"
 	"math"
 	"os"
-	"regexp"
 	"strconv"
 	"strings"
 	"unicode"
@@ -183,6 +182,9 @@ func (p *Package) Translate(f *File) {
 		numTypedefs = len(p.typedefs)
 		// Also ask about any typedefs we've seen so far.
 		for _, info := range p.typedefList {
+			if f.Name[info.typedef] != nil {
+				continue
+			}
 			n := &Name{
 				Go: info.typedef,
 				C:  info.typedef,
@@ -334,7 +336,7 @@ func (p *Package) guessKinds(f *File) []*Name {
 	//	void __cgo_f_xxx_5(void) { static const char __cgo_undefined__5[] = (name); }
 	//
 	// If we see an error at not-declared:xxx, the corresponding name is not declared.
-	// If we see an error at not-type:xxx, the corresponding name is a type.
+	// If we see an error at not-type:xxx, the corresponding name is not a type.
 	// If we see an error at not-int-const:xxx, the corresponding name is not an integer constant.
 	// If we see an error at not-num-const:xxx, the corresponding name is not a number constant.
 	// If we see an error at not-str-lit:xxx, the corresponding name is not a string literal.
@@ -711,6 +713,9 @@ func (p *Package) prepareNames(f *File) {
 			}
 		}
 		p.mangleName(n)
+		if n.Kind == "type" && typedef[n.Mangle] == nil {
+			typedef[n.Mangle] = n.Type
+		}
 	}
 }
 
@@ -794,10 +799,10 @@ func (p *Package) rewriteCall(f *File, call *Call) (string, bool) {
 	params := name.FuncType.Params
 	args := call.Call.Args
 
-	// Avoid a crash if the number of arguments is
-	// less than the number of parameters.
+	// Avoid a crash if the number of arguments doesn't match
+	// the number of parameters.
 	// This will be caught when the generated file is compiled.
-	if len(args) < len(params) {
+	if len(args) != len(params) {
 		return "", false
 	}
 
@@ -817,7 +822,7 @@ func (p *Package) rewriteCall(f *File, call *Call) (string, bool) {
 	// Rewrite C.f(p) to
 	//    func() {
 	//            _cgo0 := p
-	//            _cgoCheckPointer(_cgo0)
+	//            _cgoCheckPointer(_cgo0, nil)
 	//            C.f(_cgo0)
 	//    }()
 	// Using a function literal like this lets us evaluate the
@@ -835,7 +840,7 @@ func (p *Package) rewriteCall(f *File, call *Call) (string, bool) {
 	//    defer func() func() {
 	//            _cgo0 := p
 	//            return func() {
-	//                    _cgoCheckPointer(_cgo0)
+	//                    _cgoCheckPointer(_cgo0, nil)
 	//                    C.f(_cgo0)
 	//            }
 	//    }()()
@@ -922,7 +927,7 @@ func (p *Package) rewriteCall(f *File, call *Call) (string, bool) {
 		}
 
 		fmt.Fprintf(&sb, "_cgo%d := %s; ", i, gofmtPos(arg, origArg.Pos()))
-		fmt.Fprintf(&sbCheck, "_cgoCheckPointer(_cgo%d); ", i)
+		fmt.Fprintf(&sbCheck, "_cgoCheckPointer(_cgo%d, nil); ", i)
 	}
 
 	if call.Deferred {
@@ -1240,6 +1245,8 @@ func (p *Package) isType(t ast.Expr) bool {
 		if strings.HasPrefix(t.Name, "_Ctype_") {
 			return true
 		}
+	case *ast.ParenExpr:
+		return p.isType(t.X)
 	case *ast.StarExpr:
 		return p.isType(t.X)
 	case *ast.ArrayType, *ast.StructType, *ast.FuncType, *ast.InterfaceType,
@@ -1257,6 +1264,8 @@ func (p *Package) isVariable(x ast.Expr) bool {
 		return true
 	case *ast.SelectorExpr:
 		return p.isVariable(x.X)
+	case *ast.IndexExpr:
+		return true
 	}
 	return false
 }
@@ -1345,6 +1354,9 @@ func (p *Package) rewriteRef(f *File) {
 
 		if *godefs {
 			// Substitute definition for mangled type name.
+			if r.Name.Type != nil {
+				expr = r.Name.Type.Go
+			}
 			if id, ok := expr.(*ast.Ident); ok {
 				if t := typedef[id.Name]; t != nil {
 					expr = t.Go
@@ -1410,9 +1422,7 @@ func (p *Package) rewriteName(f *File, r *Ref) ast.Expr {
 				r.Context = ctxType
 				if r.Name.Type == nil {
 					error_(r.Pos(), "invalid conversion to C.%s: undefined C type '%s'", fixGo(r.Name.Go), r.Name.C)
-					break
 				}
-				expr = r.Name.Type.Go
 				break
 			}
 			error_(r.Pos(), "call of non-function C.%s", fixGo(r.Name.Go))
@@ -1469,9 +1479,7 @@ func (p *Package) rewriteName(f *File, r *Ref) ast.Expr {
 			// Okay - might be new(T)
 			if r.Name.Type == nil {
 				error_(r.Pos(), "expression C.%s: undefined C type '%s'", fixGo(r.Name.Go), r.Name.C)
-				break
 			}
-			expr = r.Name.Type.Go
 		case "var":
 			expr = &ast.StarExpr{Star: (*r.Expr).Pos(), X: expr}
 		case "macro":
@@ -1490,8 +1498,6 @@ func (p *Package) rewriteName(f *File, r *Ref) ast.Expr {
 			// Use of C.enum_x, C.struct_x or C.union_x without C definition.
 			// GCC won't raise an error when using pointers to such unknown types.
 			error_(r.Pos(), "type C.%s: undefined C type '%s'", fixGo(r.Name.Go), r.Name.C)
-		} else {
-			expr = r.Name.Type.Go
 		}
 	default:
 		if r.Name.Kind == "func" {
@@ -2047,8 +2053,6 @@ type typeConv struct {
 
 	ptrSize int64
 	intSize int64
-
-	exactWidthIntegerTypes map[string]*Type
 }
 
 var tagGen int
@@ -2058,6 +2062,10 @@ var goIdent = make(map[string]*ast.Ident)
 // unionWithPointer is true for a Go type that represents a C union (or class)
 // that may contain a pointer. This is used for cgo pointer checking.
 var unionWithPointer = make(map[ast.Expr]bool)
+
+// anonymousStructTag provides a consistent tag for an anonymous struct.
+// The same dwarf.StructType pointer will always get the same tag.
+var anonymousStructTag = make(map[*dwarf.StructType]string)
 
 func (c *typeConv) Init(ptrSize, intSize int64) {
 	c.ptrSize = ptrSize
@@ -2090,21 +2098,6 @@ func (c *typeConv) Init(ptrSize, intSize int64) {
 		c.goVoidPtr = &ast.StarExpr{X: c.byte}
 	} else {
 		c.goVoidPtr = c.Ident("unsafe.Pointer")
-	}
-
-	c.exactWidthIntegerTypes = make(map[string]*Type)
-	for _, t := range []ast.Expr{
-		c.int8, c.int16, c.int32, c.int64,
-		c.uint8, c.uint16, c.uint32, c.uint64,
-	} {
-		name := t.(*ast.Ident).Name
-		u := new(Type)
-		*u = *goTypes[name]
-		if u.Align > ptrSize {
-			u.Align = ptrSize
-		}
-		u.Go = t
-		c.exactWidthIntegerTypes[name] = u
 	}
 }
 
@@ -2203,6 +2196,11 @@ func (c *typeConv) FinishType(pos token.Pos) {
 // Type returns a *Type with the same memory layout as
 // dtype when used as the type of a variable or a struct field.
 func (c *typeConv) Type(dtype dwarf.Type, pos token.Pos) *Type {
+	return c.loadType(dtype, pos, "")
+}
+
+// loadType recursively loads the requested dtype and its dependency graph.
+func (c *typeConv) loadType(dtype dwarf.Type, pos token.Pos, parent string) *Type {
 	// Always recompute bad pointer typedefs, as the set of such
 	// typedefs changes as we see more types.
 	checkCache := true
@@ -2210,7 +2208,9 @@ func (c *typeConv) Type(dtype dwarf.Type, pos token.Pos) *Type {
 		checkCache = false
 	}
 
-	key := dtype.String()
+	// The cache key should be relative to its parent.
+	// See issue https://golang.org/issue/31891
+	key := parent + " > " + dtype.String()
 
 	if checkCache {
 		if t, ok := c.m[key]; ok {
@@ -2415,8 +2415,12 @@ func (c *typeConv) Type(dtype dwarf.Type, pos token.Pos) *Type {
 			break
 		}
 		if tag == "" {
-			tag = "__" + strconv.Itoa(tagGen)
-			tagGen++
+			tag = anonymousStructTag[dt]
+			if tag == "" {
+				tag = "__" + strconv.Itoa(tagGen)
+				tagGen++
+				anonymousStructTag[dt] = tag
+			}
 		} else if t.C.Empty() {
 			t.C.Set(dt.Kind + " " + tag)
 		}
@@ -2477,29 +2481,15 @@ func (c *typeConv) Type(dtype dwarf.Type, pos token.Pos) *Type {
 			t.Align = c.ptrSize
 			break
 		}
-		// Exact-width integer types.  These are always compatible with
-		// the corresponding Go types since the C standard requires
-		// them to have no padding bit and use the two’s complement
-		// representation.
-		if exactWidthIntegerType.MatchString(dt.Name) {
-			sub := c.Type(dt.Type, pos)
-			goname := strings.TrimPrefix(dt.Name, "__")
-			goname = strings.TrimSuffix(goname, "_t")
-			u := c.exactWidthIntegerTypes[goname]
-			if sub.Size != u.Size {
-				fatalf("%s: unexpected size: %d vs. %d – %s", lineno(pos), sub.Size, u.Size, dtype)
-			}
-			if sub.Align != u.Align {
-				fatalf("%s: unexpected alignment: %d vs. %d – %s", lineno(pos), sub.Align, u.Align, dtype)
-			}
-			t.Size = u.Size
-			t.Align = u.Align
-			t.Go = u.Go
-			break
-		}
 		name := c.Ident("_Ctype_" + dt.Name)
 		goIdent[name.Name] = name
-		sub := c.Type(dt.Type, pos)
+		akey := ""
+		if c.anonymousStructTypedef(dt) {
+			// only load type recursively for typedefs of anonymous
+			// structs, see issues 37479 and 37621.
+			akey = key
+		}
+		sub := c.loadType(dt.Type, pos, akey)
 		if c.badPointerTypedef(dt) {
 			// Treat this typedef as a uintptr.
 			s := *sub
@@ -2631,8 +2621,6 @@ func (c *typeConv) Type(dtype dwarf.Type, pos token.Pos) *Type {
 
 	return t
 }
-
-var exactWidthIntegerType = regexp.MustCompile(`^(__)?u?int(8|16|32|64)_t$`)
 
 // isStructUnionClass reports whether the type described by the Go syntax x
 // is a struct, union, or class with a tag.
@@ -3022,8 +3010,16 @@ func fieldPrefix(fld []*ast.Field) string {
 	return prefix
 }
 
-// badPointerTypedef reports whether t is a C typedef that should not be considered a pointer in Go.
-// A typedef is bad if C code sometimes stores non-pointers in this type.
+// anonymousStructTypedef reports whether dt is a C typedef for an anonymous
+// struct.
+func (c *typeConv) anonymousStructTypedef(dt *dwarf.TypedefType) bool {
+	st, ok := dt.Type.(*dwarf.StructType)
+	return ok && st.StructName == ""
+}
+
+// badPointerTypedef reports whether dt is a C typedef that should not be
+// considered a pointer in Go. A typedef is bad if C code sometimes stores
+// non-pointers in this type.
 // TODO: Currently our best solution is to find these manually and list them as
 // they come up. A better solution is desired.
 func (c *typeConv) badPointerTypedef(dt *dwarf.TypedefType) bool {
@@ -3033,7 +3029,7 @@ func (c *typeConv) badPointerTypedef(dt *dwarf.TypedefType) bool {
 	if c.badJNI(dt) {
 		return true
 	}
-	if c.badEGLDisplay(dt) {
+	if c.badEGLType(dt) {
 		return true
 	}
 	return false
@@ -3172,11 +3168,11 @@ func (c *typeConv) badJNI(dt *dwarf.TypedefType) bool {
 	return false
 }
 
-func (c *typeConv) badEGLDisplay(dt *dwarf.TypedefType) bool {
-	if dt.Name != "EGLDisplay" {
+func (c *typeConv) badEGLType(dt *dwarf.TypedefType) bool {
+	if dt.Name != "EGLDisplay" && dt.Name != "EGLConfig" {
 		return false
 	}
-	// Check that the typedef is "typedef void *EGLDisplay".
+	// Check that the typedef is "typedef void *<name>".
 	if ptr, ok := dt.Type.(*dwarf.PtrType); ok {
 		if _, ok := ptr.Type.(*dwarf.VoidType); ok {
 			return true

@@ -76,23 +76,24 @@ func cgoCheckMemmove(typ *_type, dst, src unsafe.Pointer, off, size uintptr) {
 	cgoCheckTypedBlock(typ, src, off, size)
 }
 
-// cgoCheckSliceCopy is called when copying n elements of a slice from
-// src to dst.  typ is the element type of the slice.
+// cgoCheckSliceCopy is called when copying n elements of a slice.
+// src and dst are pointers to the first element of the slice.
+// typ is the element type of the slice.
 // It throws if the program is copying slice elements that contain Go pointers
 // into non-Go memory.
 //go:nosplit
 //go:nowritebarrier
-func cgoCheckSliceCopy(typ *_type, dst, src slice, n int) {
+func cgoCheckSliceCopy(typ *_type, dst, src unsafe.Pointer, n int) {
 	if typ.ptrdata == 0 {
 		return
 	}
-	if !cgoIsGoPointer(src.array) {
+	if !cgoIsGoPointer(src) {
 		return
 	}
-	if cgoIsGoPointer(dst.array) {
+	if cgoIsGoPointer(dst) {
 		return
 	}
-	p := src.array
+	p := src
 	for i := 0; i < n; i++ {
 		cgoCheckTypedBlock(typ, p, 0, typ.size)
 		p = add(p, typ.size)
@@ -133,7 +134,7 @@ func cgoCheckTypedBlock(typ *_type, src unsafe.Pointer, off, size uintptr) {
 	}
 
 	s := spanOfUnchecked(uintptr(src))
-	if s.state == mSpanManual {
+	if s.state.get() == mSpanManual {
 		// There are no heap bits for value stored on the stack.
 		// For a channel receive src might be on the stack of some
 		// other goroutine, so we can't unwind the stack even if

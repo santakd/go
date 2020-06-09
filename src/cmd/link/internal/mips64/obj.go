@@ -1,5 +1,5 @@
 // Inferno utils/5l/obj.c
-// https://bitbucket.org/inferno-os/inferno-os/src/default/utils/5l/obj.c
+// https://bitbucket.org/inferno-os/inferno-os/src/master/utils/5l/obj.c
 //
 //	Copyright © 1994-1999 Lucent Technologies Inc.  All rights reserved.
 //	Portions Copyright © 1995-1997 C H Forsyth (forsyth@terzarima.net)
@@ -56,7 +56,7 @@ func Init() (*sys.Arch, ld.Arch) {
 		Asmb2:            asmb2,
 		Elfreloc1:        elfreloc1,
 		Elfsetupplt:      elfsetupplt,
-		Gentext:          gentext,
+		Gentext2:         gentext2,
 		Machoreloc1:      machoreloc1,
 
 		Linuxdynld:     "/lib64/ld64.so.1",
@@ -90,17 +90,6 @@ func archinit(ctxt *ld.Link) {
 		ld.HEADR = ld.ELFRESERVE
 		if *ld.FlagTextAddr == -1 {
 			*ld.FlagTextAddr = 0x10000 + int64(ld.HEADR)
-		}
-		if *ld.FlagRound == -1 {
-			*ld.FlagRound = 0x10000
-		}
-
-	case objabi.Hnacl:
-		ld.Elfinit(ctxt)
-		ld.HEADR = 0x10000
-		ld.Funcalign = 16
-		if *ld.FlagTextAddr == -1 {
-			*ld.FlagTextAddr = 0x20000
 		}
 		if *ld.FlagRound == -1 {
 			*ld.FlagRound = 0x10000

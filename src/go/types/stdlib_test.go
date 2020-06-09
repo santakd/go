@@ -156,6 +156,7 @@ func TestStdTest(t *testing.T) {
 
 	testTestDir(t, filepath.Join(runtime.GOROOT(), "test"),
 		"cmplxdivide.go", // also needs file cmplxdivide1.go - ignore
+		"directive.go",   // tests compiler rejection of bad directive placement - ignore
 	)
 }
 
@@ -180,6 +181,9 @@ func TestStdFixed(t *testing.T) {
 		"issue22200b.go", // go/types does not have constraints on stack size
 		"issue25507.go",  // go/types does not have constraints on stack size
 		"issue20780.go",  // go/types does not have constraints on stack size
+		"issue31747.go",  // go/types does not have constraints on language level (-lang=go1.12) (see #31793)
+		"issue34329.go",  // go/types does not have constraints on language level (-lang=go1.13) (see #31793)
+		"bug251.go",      // issue #34333 which was exposed with fix for #34151
 	)
 }
 

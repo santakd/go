@@ -37,6 +37,17 @@ func (gcToolchain) linker() string {
 	return base.Tool("link")
 }
 
+func pkgPath(a *Action) string {
+	p := a.Package
+	ppath := p.ImportPath
+	if cfg.BuildBuildmode == "plugin" {
+		ppath = pluginPath(a)
+	} else if p.Name == "main" && !p.Internal.ForceLibrary {
+		ppath = "main"
+	}
+	return ppath
+}
+
 func (gcToolchain) gc(b *Builder, a *Action, archive string, importcfg []byte, symabis string, asmhdr bool, gofiles []string) (ofile string, output []byte, err error) {
 	p := a.Package
 	objdir := a.Objdir
@@ -47,12 +58,7 @@ func (gcToolchain) gc(b *Builder, a *Action, archive string, importcfg []byte, s
 		ofile = objdir + out
 	}
 
-	pkgpath := p.ImportPath
-	if cfg.BuildBuildmode == "plugin" {
-		pkgpath = pluginPath(a)
-	} else if p.Name == "main" && !p.Internal.ForceLibrary {
-		pkgpath = "main"
-	}
+	pkgpath := pkgPath(a)
 	gcargs := []string{"-p", pkgpath}
 	if p.Module != nil && p.Module.GoVersion != "" && allowedVersion(p.Module.GoVersion) {
 		gcargs = append(gcargs, "-lang=go"+p.Module.GoVersion)
@@ -92,8 +98,7 @@ func (gcToolchain) gc(b *Builder, a *Action, archive string, importcfg []byte, s
 	if a.buildID != "" {
 		gcargs = append(gcargs, "-buildid", a.buildID)
 	}
-	platform := cfg.Goos + "/" + cfg.Goarch
-	if p.Internal.OmitDebug || platform == "nacl/amd64p32" || cfg.Goos == "plan9" || cfg.Goarch == "wasm" {
+	if p.Internal.OmitDebug || cfg.Goos == "plan9" || cfg.Goarch == "wasm" {
 		gcargs = append(gcargs, "-dwarf=false")
 	}
 	if strings.HasPrefix(runtimeVersion, "go1") && !strings.Contains(os.Args[0], "go_bootstrap") {
@@ -140,7 +145,7 @@ func (gcToolchain) gc(b *Builder, a *Action, archive string, importcfg []byte, s
 		args = append(args, mkAbs(p.Dir, f))
 	}
 
-	output, err = b.runOut(p.Dir, nil, args...)
+	output, err = b.runOut(a, p.Dir, nil, args...)
 	return ofile, output, err
 }
 
@@ -163,7 +168,7 @@ func gcBackendConcurrency(gcflags []string) int {
 CheckFlags:
 	for _, flag := range gcflags {
 		// Concurrent compilation is presumed incompatible with any gcflags,
-		// except for a small whitelist of commonly used flags.
+		// except for known commonly used flags.
 		// If the user knows better, they can manually add their own -c to the gcflags.
 		switch flag {
 		case "-N", "-l", "-S", "-B", "-C", "-I":
@@ -218,6 +223,10 @@ CheckFlags:
 // trimpath returns the -trimpath argument to use
 // when compiling the action.
 func (a *Action) trimpath() string {
+	// Keep in sync with Builder.ccompile
+	// The trimmed paths are a little different, but we need to trim in the
+	// same situations.
+
 	// Strip the object directory entirely.
 	objdir := a.Objdir
 	if len(objdir) > 1 && objdir[len(objdir)-1] == filepath.Separator {
@@ -228,8 +237,8 @@ func (a *Action) trimpath() string {
 	// For "go build -trimpath", rewrite package source directory
 	// to a file system-independent path (just the import path).
 	if cfg.BuildTrimpath {
-		if m := a.Package.Module; m != nil {
-			rewrite += ";" + m.Dir + "=>" + m.Path + "@" + m.Version
+		if m := a.Package.Module; m != nil && m.Version != "" {
+			rewrite += ";" + a.Package.Dir + "=>" + m.Path + "@" + m.Version + strings.TrimPrefix(a.Package.ImportPath, m.Path)
 		} else {
 			rewrite += ";" + a.Package.Dir + "=>" + a.Package.ImportPath
 		}
@@ -241,7 +250,8 @@ func (a *Action) trimpath() string {
 func asmArgs(a *Action, p *load.Package) []interface{} {
 	// Add -I pkg/GOOS_GOARCH so #include "textflag.h" works in .s files.
 	inc := filepath.Join(cfg.GOROOT, "pkg", "include")
-	args := []interface{}{cfg.BuildToolexec, base.Tool("asm"), "-trimpath", a.trimpath(), "-I", a.Objdir, "-I", inc, "-D", "GOOS_" + cfg.Goos, "-D", "GOARCH_" + cfg.Goarch, forcedAsmflags, p.Internal.Asmflags}
+	pkgpath := pkgPath(a)
+	args := []interface{}{cfg.BuildToolexec, base.Tool("asm"), "-p", pkgpath, "-trimpath", a.trimpath(), "-I", a.Objdir, "-I", inc, "-D", "GOOS_" + cfg.Goos, "-D", "GOARCH_" + cfg.Goarch, forcedAsmflags, p.Internal.Asmflags}
 	if p.ImportPath == "runtime" && cfg.Goarch == "386" {
 		for _, arg := range forcedAsmflags {
 			if arg == "-dynlink" {
@@ -306,55 +316,6 @@ func (gcToolchain) symabis(b *Builder, a *Action, sfiles []string) (string, erro
 		symabis = a.Objdir + "symabis"
 		if err := mkSymabis(p, sfiles, symabis); err != nil {
 			return "", err
-		}
-	}
-
-	// Gather known cross-package references from assembly code.
-	var otherPkgs []string
-	if p.ImportPath == "runtime" {
-		// Assembly in the following packages references
-		// symbols in runtime.
-		otherPkgs = []string{"syscall", "internal/syscall/unix", "runtime/cgo"}
-	} else if p.ImportPath == "runtime/internal/atomic" {
-		// sync/atomic is an assembly wrapper around
-		// runtime/internal/atomic.
-		otherPkgs = []string{"sync/atomic"}
-	}
-	for _, p2name := range otherPkgs {
-		p2 := load.LoadImportWithFlags(p2name, p.Dir, p, &load.ImportStack{}, nil, 0)
-		if len(p2.SFiles) == 0 {
-			continue
-		}
-
-		symabis2 := a.Objdir + "symabis2"
-		if err := mkSymabis(p2, p2.SFiles, symabis2); err != nil {
-			return "", err
-		}
-
-		// Filter out just the symbol refs and append them to
-		// the symabis file.
-		if cfg.BuildN {
-			// -x will print the lines from symabis2 that are actually appended
-			// to symabis. With -n, we don't know what those lines will be.
-			b.Showcmd("", `grep '^ref' <%s | grep -v '^ref\s*""\.' >>%s`, symabis2, a.Objdir+"symabis")
-			continue
-		}
-		abis2, err := ioutil.ReadFile(symabis2)
-		if err != nil {
-			return "", err
-		}
-		var refs bytes.Buffer
-		for _, line := range strings.Split(string(abis2), "\n") {
-			fs := strings.Fields(line)
-			if len(fs) >= 2 && fs[0] == "ref" && !strings.HasPrefix(fs[1], `"".`) {
-				fmt.Fprintf(&refs, "%s\n", line)
-			}
-		}
-		if refs.Len() != 0 {
-			symabis = a.Objdir + "symabis"
-			if err := b.appendFile(symabis, refs.Bytes()); err != nil {
-				return "", err
-			}
 		}
 	}
 
@@ -510,7 +471,21 @@ func pluginPath(a *Action) string {
 		return p.ImportPath
 	}
 	h := sha1.New()
-	fmt.Fprintf(h, "build ID: %s\n", a.buildID)
+	buildID := a.buildID
+	if a.Mode == "link" {
+		// For linking, use the main package's build ID instead of
+		// the binary's build ID, so it is the same hash used in
+		// compiling and linking.
+		// When compiling, we use actionID/actionID (instead of
+		// actionID/contentID) as a temporary build ID to compute
+		// the hash. Do the same here. (See buildid.go:useCache)
+		// The build ID matters because it affects the overall hash
+		// in the plugin's pseudo-import path returned below.
+		// We need to use the same import path when compiling and linking.
+		id := strings.Split(buildID, buildIDSeparator)
+		buildID = id[1] + buildIDSeparator + id[1]
+	}
+	fmt.Fprintf(h, "build ID: %s\n", buildID)
 	for _, file := range str.StringList(p.GoFiles, p.CgoFiles, p.SFiles) {
 		data, err := ioutil.ReadFile(filepath.Join(p.Dir, file))
 		if err != nil {
@@ -542,11 +517,11 @@ func (gcToolchain) ld(b *Builder, root *Action, out, importcfg, mainpkg string) 
 	// Store BuildID inside toolchain binaries as a unique identifier of the
 	// tool being run, for use by content-based staleness determination.
 	if root.Package.Goroot && strings.HasPrefix(root.Package.ImportPath, "cmd/") {
-		// When buildmode=pie, external linking will include our build
-		// id in the external linker's build id, which will cause our
-		// build id to not match the next time the tool is built.
+		// External linking will include our build id in the external
+		// linker's build id, which will cause our build id to not
+		// match the next time the tool is built.
 		// Rely on the external build id instead.
-		if ldBuildmode != "pie" || !sys.PIEDefaultsToExternalLink(cfg.Goos, cfg.Goarch) {
+		if !sys.MustLinkExternal(cfg.Goos, cfg.Goarch) {
 			ldflags = append(ldflags, "-X=cmd/internal/objabi.buildID="+root.buildID)
 		}
 	}

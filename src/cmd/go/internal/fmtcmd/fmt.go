@@ -6,11 +6,11 @@
 package fmtcmd
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
-	"strings"
 	"sync"
 
 	"cmd/go/internal/base"
@@ -22,6 +22,7 @@ import (
 
 func init() {
 	base.AddBuildFlagsNX(&CmdFmt.Flag)
+	base.AddLoadFlags(&CmdFmt.Flag)
 }
 
 var CmdFmt = &base.Command{
@@ -37,6 +38,9 @@ For more about specifying packages, see 'go help packages'.
 
 The -n flag prints commands that would be executed.
 The -x flag prints commands as they are executed.
+
+The -mod flag's value sets which module download mode
+to use: readonly or vendor. See 'go help modules' for more.
 
 To run gofmt with specific options, run gofmt itself.
 
@@ -68,11 +72,12 @@ func runFmt(cmd *base.Command, args []string) {
 			continue
 		}
 		if pkg.Error != nil {
-			if strings.HasPrefix(pkg.Error.Err, "build constraints exclude all Go files") {
+			var nogo *load.NoGoError
+			if errors.As(pkg.Error, &nogo) && len(pkg.InternalAllGoFiles()) > 0 {
 				// Skip this error, as we will format
 				// all files regardless.
 			} else {
-				base.Errorf("can't load package: %s", pkg.Error)
+				base.Errorf("%v", pkg.Error)
 				continue
 			}
 		}

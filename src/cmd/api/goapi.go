@@ -26,6 +26,7 @@ import (
 	"runtime"
 	"sort"
 	"strings"
+	"sync"
 )
 
 func goCmd() string {
@@ -59,8 +60,6 @@ var contexts = []*build.Context{
 	{GOOS: "linux", GOARCH: "amd64"},
 	{GOOS: "linux", GOARCH: "arm", CgoEnabled: true},
 	{GOOS: "linux", GOARCH: "arm"},
-	{GOOS: "darwin", GOARCH: "386", CgoEnabled: true},
-	{GOOS: "darwin", GOARCH: "386"},
 	{GOOS: "darwin", GOARCH: "amd64", CgoEnabled: true},
 	{GOOS: "darwin", GOARCH: "amd64"},
 	{GOOS: "windows", GOARCH: "amd64"},
@@ -138,53 +137,37 @@ func main() {
 		c.Compiler = build.Default.Compiler
 	}
 
-	var pkgNames []string
-	if flag.NArg() > 0 {
-		pkgNames = flag.Args()
-	} else {
-		stds, err := exec.Command(goCmd(), "list", "std").Output()
-		if err != nil {
-			log.Fatal(err)
-		}
-		for _, pkg := range strings.Fields(string(stds)) {
-			if !internalPkg.MatchString(pkg) {
-				pkgNames = append(pkgNames, pkg)
-			}
-		}
+	walkers := make([]*Walker, len(contexts))
+	var wg sync.WaitGroup
+	for i, context := range contexts {
+		i, context := i, context
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			walkers[i] = NewWalker(context, filepath.Join(build.Default.GOROOT, "src"))
+		}()
 	}
+	wg.Wait()
 
 	var featureCtx = make(map[string]map[string]bool) // feature -> context name -> true
-	for _, context := range contexts {
-		w := NewWalker(context, filepath.Join(build.Default.GOROOT, "src"))
-		w.loadImports(pkgNames, w.context)
-
-		for _, name := range pkgNames {
-			// Vendored packages do not contribute to our
-			// public API surface.
-			if strings.HasPrefix(name, "vendor/") {
-				continue
-			}
-			// - Package "unsafe" contains special signatures requiring
-			//   extra care when printing them - ignore since it is not
-			//   going to change w/o a language change.
-			// - We don't care about the API of commands.
-			if name != "unsafe" && !strings.HasPrefix(name, "cmd/") {
-				if name == "runtime/cgo" && !context.CgoEnabled {
-					// w.Import(name) will return nil
-					continue
-				}
-				pkg, err := w.Import(name)
-				if _, nogo := err.(*build.NoGoError); nogo {
-					continue
-				}
-				if err != nil {
-					log.Fatalf("Import(%q): %v", name, err)
-				}
-				w.export(pkg)
-			}
+	for _, w := range walkers {
+		pkgNames := w.stdPackages
+		if flag.NArg() > 0 {
+			pkgNames = flag.Args()
 		}
 
-		ctxName := contextName(context)
+		for _, name := range pkgNames {
+			pkg, err := w.Import(name)
+			if _, nogo := err.(*build.NoGoError); nogo {
+				continue
+			}
+			if err != nil {
+				log.Fatalf("Import(%q): %v", name, err)
+			}
+			w.export(pkg)
+		}
+
+		ctxName := contextName(w.context)
 		for _, f := range w.Features() {
 			if featureCtx[f] == nil {
 				featureCtx[f] = make(map[string]bool)
@@ -267,6 +250,13 @@ func featureWithoutContext(f string) string {
 	return spaceParensRx.ReplaceAllString(f, "")
 }
 
+// portRemoved reports whether the given port-specific API feature is
+// okay to no longer exist because its port was removed.
+func portRemoved(feature string) bool {
+	return strings.Contains(feature, "(darwin-386)") ||
+		strings.Contains(feature, "(darwin-386-cgo)")
+}
+
 func compareAPI(w io.Writer, features, required, optional, exception []string, allowAdd bool) (ok bool) {
 	ok = true
 
@@ -294,6 +284,8 @@ func compareAPI(w io.Writer, features, required, optional, exception []string, a
 				// acknowledged by being in the file
 				// "api/except.txt". No need to print them out
 				// here.
+			} else if portRemoved(feature) {
+				// okay.
 			} else if featureSet[featureWithoutContext(feature)] {
 				// okay.
 			} else {
@@ -353,23 +345,27 @@ func fileFeatures(filename string) []string {
 var fset = token.NewFileSet()
 
 type Walker struct {
-	context   *build.Context
-	root      string
-	scope     []string
-	current   *types.Package
-	features  map[string]bool              // set
-	imported  map[string]*types.Package    // packages already imported
-	importMap map[string]map[string]string // importer dir -> import path -> canonical path
-	importDir map[string]string            // canonical import path -> dir
+	context     *build.Context
+	root        string
+	scope       []string
+	current     *types.Package
+	features    map[string]bool              // set
+	imported    map[string]*types.Package    // packages already imported
+	stdPackages []string                     // names, omitting "unsafe", internal, and vendored packages
+	importMap   map[string]map[string]string // importer dir -> import path -> canonical path
+	importDir   map[string]string            // canonical import path -> dir
+
 }
 
 func NewWalker(context *build.Context, root string) *Walker {
-	return &Walker{
+	w := &Walker{
 		context:  context,
 		root:     root,
 		features: map[string]bool{},
 		imported: map[string]*types.Package{"unsafe": types.Unsafe},
 	}
+	w.loadImports()
+	return w
 }
 
 func (w *Walker) Features() (fs []string) {
@@ -440,58 +436,120 @@ func tagKey(dir string, context *build.Context, tags []string) string {
 	return key
 }
 
-func (w *Walker) loadImports(paths []string, context *build.Context) {
-	if context == nil {
-		context = &build.Default
+type listImports struct {
+	stdPackages []string                     // names, omitting "unsafe", internal, and vendored packages
+	importDir   map[string]string            // canonical import path → directory
+	importMap   map[string]map[string]string // import path → canonical import path
+}
+
+var listCache sync.Map // map[string]listImports, keyed by contextName
+
+// listSem is a semaphore restricting concurrent invocations of 'go list'.
+var listSem = make(chan semToken, runtime.GOMAXPROCS(0))
+
+type semToken struct{}
+
+// loadImports populates w with information about the packages in the standard
+// library and the packages they themselves import in w's build context.
+//
+// The source import path and expanded import path are identical except for vendored packages.
+// For example, on return:
+//
+//	w.importMap["math"] = "math"
+//	w.importDir["math"] = "<goroot>/src/math"
+//
+//	w.importMap["golang.org/x/net/route"] = "vendor/golang.org/x/net/route"
+//	w.importDir["vendor/golang.org/x/net/route"] = "<goroot>/src/vendor/golang.org/x/net/route"
+//
+// Since the set of packages that exist depends on context, the result of
+// loadImports also depends on context. However, to improve test running time
+// the configuration for each environment is cached across runs.
+func (w *Walker) loadImports() {
+	if w.context == nil {
+		return // test-only Walker; does not use the import map
 	}
 
-	var (
-		tags       = context.BuildTags
-		cgoEnabled = "0"
-	)
-	if context.CgoEnabled {
-		tags = append(tags[:len(tags):len(tags)], "cgo")
-		cgoEnabled = "1"
-	}
+	name := contextName(w.context)
 
-	// TODO(golang.org/issue/29666): Request only the fields that we need.
-	cmd := exec.Command(goCmd(), "list", "-e", "-deps", "-json")
-	if len(tags) > 0 {
-		cmd.Args = append(cmd.Args, "-tags", strings.Join(tags, " "))
-	}
-	cmd.Args = append(cmd.Args, paths...)
+	imports, ok := listCache.Load(name)
+	if !ok {
+		listSem <- semToken{}
+		defer func() { <-listSem }()
 
-	cmd.Env = append(os.Environ(),
-		"GOOS="+context.GOOS,
-		"GOARCH="+context.GOARCH,
-		"CGO_ENABLED="+cgoEnabled,
-	)
-
-	stdout := new(bytes.Buffer)
-	cmd.Stdout = stdout
-	cmd.Stderr = new(strings.Builder)
-	err := cmd.Run()
-	if err != nil {
-		log.Fatalf("%s failed: %v\n%s", strings.Join(cmd.Args, " "), err, cmd.Stderr)
-	}
-
-	w.importDir = make(map[string]string)
-	w.importMap = make(map[string]map[string]string)
-	dec := json.NewDecoder(stdout)
-	for {
-		var pkg struct {
-			ImportPath, Dir string
-			ImportMap       map[string]string
-		}
-		if err := dec.Decode(&pkg); err == io.EOF {
-			break
-		} else if err != nil {
-			log.Fatalf("%s: invalid output: %v", strings.Join(cmd.Args, " "), err)
+		cmd := exec.Command(goCmd(), "list", "-e", "-deps", "-json", "std")
+		cmd.Env = listEnv(w.context)
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			log.Fatalf("loading imports: %v\n%s", err, out)
 		}
 
-		w.importDir[pkg.ImportPath] = pkg.Dir
-		w.importMap[pkg.Dir] = pkg.ImportMap
+		var stdPackages []string
+		importMap := make(map[string]map[string]string)
+		importDir := make(map[string]string)
+		dec := json.NewDecoder(bytes.NewReader(out))
+		for {
+			var pkg struct {
+				ImportPath, Dir string
+				ImportMap       map[string]string
+			}
+			err := dec.Decode(&pkg)
+			if err == io.EOF {
+				break
+			}
+			if err != nil {
+				log.Fatalf("go list: invalid output: %v", err)
+			}
+
+			// - Package "unsafe" contains special signatures requiring
+			//   extra care when printing them - ignore since it is not
+			//   going to change w/o a language change.
+			// - internal and vendored packages do not contribute to our
+			//   API surface.
+			// - 'go list std' does not include commands, which cannot be
+			//   imported anyway.
+			if ip := pkg.ImportPath; ip != "unsafe" && !strings.HasPrefix(ip, "vendor/") && !internalPkg.MatchString(ip) {
+				stdPackages = append(stdPackages, ip)
+			}
+			importDir[pkg.ImportPath] = pkg.Dir
+			if len(pkg.ImportMap) > 0 {
+				importMap[pkg.Dir] = make(map[string]string, len(pkg.ImportMap))
+			}
+			for k, v := range pkg.ImportMap {
+				importMap[pkg.Dir][k] = v
+			}
+		}
+
+		sort.Strings(stdPackages)
+		imports = listImports{
+			stdPackages: stdPackages,
+			importMap:   importMap,
+			importDir:   importDir,
+		}
+		imports, _ = listCache.LoadOrStore(name, imports)
 	}
+
+	li := imports.(listImports)
+	w.stdPackages = li.stdPackages
+	w.importDir = li.importDir
+	w.importMap = li.importMap
+}
+
+// listEnv returns the process environment to use when invoking 'go list' for
+// the given context.
+func listEnv(c *build.Context) []string {
+	if c == nil {
+		return os.Environ()
+	}
+
+	environ := append(os.Environ(),
+		"GOOS="+c.GOOS,
+		"GOARCH="+c.GOARCH)
+	if c.CgoEnabled {
+		environ = append(environ, "CGO_ENABLED=1")
+	} else {
+		environ = append(environ, "CGO_ENABLED=0")
+	}
+	return environ
 }
 
 // Importing is a sentinel taking the place in Walker.imported
@@ -523,7 +581,7 @@ func (w *Walker) ImportFrom(fromPath, fromDir string, mode types.ImportMode) (*t
 		dir = filepath.Join(w.root, filepath.FromSlash(name))
 	}
 	if fi, err := os.Stat(dir); err != nil || !fi.IsDir() {
-		log.Fatalf("no source in tree for import %q: %v", name, err)
+		log.Panicf("no source in tree for import %q (from import %s in %s): %v", name, fromPath, fromDir, err)
 	}
 
 	context := w.context

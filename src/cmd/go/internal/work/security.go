@@ -43,6 +43,7 @@ var re = lazyregexp.New
 
 var validCompilerFlags = []*lazyregexp.Regexp{
 	re(`-D([A-Za-z_].*)`),
+	re(`-U([A-Za-z_]*)`),
 	re(`-F([^@\-].*)`),
 	re(`-I([^@\-].*)`),
 	re(`-O`),
@@ -51,6 +52,7 @@ var validCompilerFlags = []*lazyregexp.Regexp{
 	re(`-W([^@,]+)`), // -Wall but not -Wa,-foo.
 	re(`-Wa,-mbig-obj`),
 	re(`-Wp,-D([A-Za-z_].*)`),
+	re(`-Wp,-U([A-Za-z_]*)`),
 	re(`-ansi`),
 	re(`-f(no-)?asynchronous-unwind-tables`),
 	re(`-f(no-)?blocks`),
@@ -127,6 +129,7 @@ var validCompilerFlags = []*lazyregexp.Regexp{
 var validCompilerFlagsWithNextArg = []string{
 	"-arch",
 	"-D",
+	"-U",
 	"-I",
 	"-framework",
 	"-isysroot",
@@ -181,9 +184,13 @@ var validLinkerFlags = []*lazyregexp.Regexp{
 	re(`-Wl,--enable-new-dtags`),
 	re(`-Wl,--end-group`),
 	re(`-Wl,--(no-)?export-dynamic`),
+	re(`-Wl,-E`),
 	re(`-Wl,-framework,[^,@\-][^,]+`),
+	re(`-Wl,--hash-style=(sysv|gnu|both)`),
 	re(`-Wl,-headerpad_max_install_names`),
 	re(`-Wl,--no-undefined`),
+	re(`-Wl,-R([^@\-][^,@]*$)`),
+	re(`-Wl,--just-symbols[=,]([^,@\-][^,@]+)`),
 	re(`-Wl,-rpath(-link)?[=,]([^,@\-][^,]+)`),
 	re(`-Wl,-s`),
 	re(`-Wl,-search_paths_first`),
@@ -195,6 +202,7 @@ var validLinkerFlags = []*lazyregexp.Regexp{
 	re(`-Wl,-undefined[=,]([^,@\-][^,]+)`),
 	re(`-Wl,-?-unresolved-symbols=[^,]+`),
 	re(`-Wl,--(no-)?warn-([^,]+)`),
+	re(`-Wl,-?-wrap[=,][^,@\-][^,]*`),
 	re(`-Wl,-z,(no)?execstack`),
 	re(`-Wl,-z,relro`),
 
@@ -213,6 +221,8 @@ var validLinkerFlagsWithNextArg = []string{
 	"-target",
 	"-Wl,-framework",
 	"-Wl,-rpath",
+	"-Wl,-R",
+	"-Wl,--just-symbols",
 	"-Wl,-undefined",
 }
 
@@ -274,6 +284,15 @@ Args:
 					!strings.Contains(list[i+1][4:], ",") {
 					i++
 					continue Args
+				}
+
+				// Permit -I= /path, -I $SYSROOT.
+				if i+1 < len(list) && arg == "-I" {
+					if (strings.HasPrefix(list[i+1], "=") || strings.HasPrefix(list[i+1], "$SYSROOT")) &&
+						load.SafeArg(list[i+1][1:]) {
+						i++
+						continue Args
+					}
 				}
 
 				if i+1 < len(list) {

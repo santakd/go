@@ -87,7 +87,6 @@ func direntNamlen(buf []byte) (uint64, bool) {
 	return readInt(buf, unsafe.Offsetof(Dirent{}.Namlen), unsafe.Sizeof(Dirent{}.Namlen))
 }
 
-//sys   ptrace(request int, pid int, addr uintptr, data uintptr) (err error)
 func PtraceAttach(pid int) (err error) { return ptrace(PT_ATTACH, pid, 0, 0) }
 func PtraceDetach(pid int) (err error) { return ptrace(PT_DETACH, pid, 0, 0) }
 
@@ -381,8 +380,6 @@ func writelen(fd int, buf *byte, nbuf int) (n int, err error) {
 
 func Getdirentries(fd int, buf []byte, basep *uintptr) (n int, err error) {
 	// Simulate Getdirentries using fdopendir/readdir_r/closedir.
-	const ptrSize = unsafe.Sizeof(uintptr(0))
-
 	// We store the number of entries to skip in the seek
 	// offset of fd. See issue #31368.
 	// It's not the full required semantics, but should handle the case

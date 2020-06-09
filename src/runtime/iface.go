@@ -66,6 +66,12 @@ func getitab(inter *interfacetype, typ *_type, canfail bool) *itab {
 	m = (*itab)(persistentalloc(unsafe.Sizeof(itab{})+uintptr(len(inter.mhdr)-1)*sys.PtrSize, 0, &memstats.other_sys))
 	m.inter = inter
 	m._type = typ
+	// The hash is used in type switches. However, compiler statically generates itab's
+	// for all interface/type pairs used in switches (which are added to itabTable
+	// in itabsinit). The dynamically-generated itab's never participate in type switches,
+	// and thus the hash is irrelevant.
+	// Note: m.hash is _not_ the hash used for the runtime itabTable hash table.
+	m.hash = 0
 	m.init()
 	itabAdd(m)
 	unlock(&itabLock)
@@ -233,11 +239,11 @@ imethods:
 		return iname
 	}
 	m.fun[0] = uintptr(fun0)
-	m.hash = typ.hash
 	return ""
 }
 
 func itabsinit() {
+	lockInit(&itabLock, lockRankItab)
 	lock(&itabLock)
 	for _, md := range activeModules() {
 		for _, i := range md.itablinks {
@@ -295,11 +301,11 @@ var (
 	stringEface interface{} = stringInterfacePtr("")
 	sliceEface  interface{} = sliceInterfacePtr(nil)
 
-	uint16Type *_type = (*eface)(unsafe.Pointer(&uint16Eface))._type
-	uint32Type *_type = (*eface)(unsafe.Pointer(&uint32Eface))._type
-	uint64Type *_type = (*eface)(unsafe.Pointer(&uint64Eface))._type
-	stringType *_type = (*eface)(unsafe.Pointer(&stringEface))._type
-	sliceType  *_type = (*eface)(unsafe.Pointer(&sliceEface))._type
+	uint16Type *_type = efaceOf(&uint16Eface)._type
+	uint32Type *_type = efaceOf(&uint32Eface)._type
+	uint64Type *_type = efaceOf(&uint64Eface)._type
+	stringType *_type = efaceOf(&stringEface)._type
+	sliceType  *_type = efaceOf(&sliceEface)._type
 )
 
 // The conv and assert functions below do very similar things.
@@ -326,8 +332,11 @@ func convT2E(t *_type, elem unsafe.Pointer) (e eface) {
 }
 
 func convT16(val uint16) (x unsafe.Pointer) {
-	if val == 0 {
-		x = unsafe.Pointer(&zeroVal[0])
+	if val < uint16(len(staticuint64s)) {
+		x = unsafe.Pointer(&staticuint64s[val])
+		if sys.BigEndian {
+			x = add(x, 6)
+		}
 	} else {
 		x = mallocgc(2, uint16Type, false)
 		*(*uint16)(x) = val
@@ -336,8 +345,11 @@ func convT16(val uint16) (x unsafe.Pointer) {
 }
 
 func convT32(val uint32) (x unsafe.Pointer) {
-	if val == 0 {
-		x = unsafe.Pointer(&zeroVal[0])
+	if val < uint32(len(staticuint64s)) {
+		x = unsafe.Pointer(&staticuint64s[val])
+		if sys.BigEndian {
+			x = add(x, 4)
+		}
 	} else {
 		x = mallocgc(4, uint32Type, false)
 		*(*uint32)(x) = val
@@ -346,8 +358,8 @@ func convT32(val uint32) (x unsafe.Pointer) {
 }
 
 func convT64(val uint64) (x unsafe.Pointer) {
-	if val == 0 {
-		x = unsafe.Pointer(&zeroVal[0])
+	if val < uint64(len(staticuint64s)) {
+		x = unsafe.Pointer(&staticuint64s[val])
 	} else {
 		x = mallocgc(8, uint64Type, false)
 		*(*uint64)(x) = val
@@ -516,8 +528,8 @@ func iterate_itabs(fn func(*itab)) {
 	}
 }
 
-// staticbytes is used to avoid convT2E for byte-sized values.
-var staticbytes = [...]byte{
+// staticuint64s is used to avoid allocating in convTx for small integer values.
+var staticuint64s = [...]uint64{
 	0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
 	0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f,
 	0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17,

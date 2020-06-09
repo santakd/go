@@ -55,7 +55,7 @@ For example:
 
 The default pkg-config tool may be changed by setting the PKG_CONFIG environment variable.
 
-For security reasons, only a limited set of flags are allowed, notably -D, -I, and -l.
+For security reasons, only a limited set of flags are allowed, notably -D, -U, -I, and -l.
 To allow additional flags, set CGO_CFLAGS_ALLOW to a regular expression
 matching the new flags. To disallow flags that would otherwise be allowed,
 set CGO_CFLAGS_DISALLOW to a regular expression matching arguments
@@ -99,7 +99,7 @@ Will be expanded to:
 
 When the Go tool sees that one or more Go files use the special import
 "C", it will look for other non-Go files in the directory and compile
-them as part of the Go package. Any .c, .s, or .S files will be
+them as part of the Go package. Any .c, .s, .S or .sx files will be
 compiled with the C compiler. Any .cc, .cpp, or .cxx files will be
 compiled with the C++ compiler. Any .f, .F, .for or .f90 files will be
 compiled with the fortran compiler. Any .h, .hh, .hpp, or .hxx files will
@@ -148,8 +148,6 @@ C.long, C.ulong (unsigned long), C.longlong (long long),
 C.ulonglong (unsigned long long), C.float, C.double,
 C.complexfloat (complex float), and C.complexdouble (complex double).
 The C type void* is represented by Go's unsafe.Pointer.
-The C sized integer types (int8_t, uint8_t, …) are represented by their Go
-counterparts (int8, uint8, …).
 The C types __int128_t and __uint128_t are represented by [16]byte.
 
 A few special C types which would normally be represented by a pointer
@@ -298,7 +296,7 @@ Go functions can be exported for use by C code in the following way:
 
 They will be available in the C code as:
 
-	extern int64_t MyFunction(int arg1, int arg2, GoString arg3);
+	extern GoInt64 MyFunction(int arg1, int arg2, GoString arg3);
 	extern struct MyFunction2_return MyFunction2(int arg1, int arg2, GoString arg3);
 
 found in the _cgo_export.h generated header, after any preambles
@@ -415,7 +413,7 @@ type in Go are instead represented by a uintptr. Those include:
 	jobjectArray
 	jweak
 
-3. The EGLDisplay type from the EGL API.
+3. The EGLDisplay and EGLConfig types from the EGL API.
 
 These types are uintptr on the Go side because they would otherwise
 confuse the Go garbage collector; they are sometimes not really
@@ -431,10 +429,15 @@ from Go 1.9 and earlier, use the cftype or jni rewrites in the Go fix tool:
 
 It will replace nil with 0 in the appropriate places.
 
-The EGLDisplay case were introduced in Go 1.12. Use the egl rewrite
+The EGLDisplay case was introduced in Go 1.12. Use the egl rewrite
 to auto-update code from Go 1.11 and earlier:
 
 	go tool fix -r egl <pkg>
+
+The EGLConfig case was introduced in Go 1.15. Use the eglconf rewrite
+to auto-update code from Go 1.14 and earlier:
+
+	go tool fix -r eglconf <pkg>
 
 Using cgo directly
 
@@ -987,7 +990,7 @@ produces a file named a.out, even if cmd/link does so by invoking the host
 linker in external linking mode.
 
 By default, cmd/link will decide the linking mode as follows: if the only
-packages using cgo are those on a whitelist of standard library
+packages using cgo are those on a list of known standard library
 packages (net, os/user, runtime/cgo), cmd/link will use internal linking
 mode. Otherwise, there are non-standard cgo packages involved, and cmd/link
 will use external linking mode. The first rule means that a build of

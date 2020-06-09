@@ -19,7 +19,7 @@ import (
 type mcache struct {
 	// The following members are accessed on every malloc,
 	// so they are grouped here for better caching.
-	next_sample int32   // trigger heap sample after allocating this many bytes
+	next_sample uintptr // trigger heap sample after allocating this many bytes
 	local_scan  uintptr // bytes of scannable heap allocated
 
 	// Allocator cache for tiny objects w/o pointers.
@@ -83,10 +83,13 @@ type stackfreelist struct {
 var emptymspan mspan
 
 func allocmcache() *mcache {
-	lock(&mheap_.lock)
-	c := (*mcache)(mheap_.cachealloc.alloc())
-	c.flushGen = mheap_.sweepgen
-	unlock(&mheap_.lock)
+	var c *mcache
+	systemstack(func() {
+		lock(&mheap_.lock)
+		c = (*mcache)(mheap_.cachealloc.alloc())
+		c.flushGen = mheap_.sweepgen
+		unlock(&mheap_.lock)
+	})
 	for i := range c.alloc {
 		c.alloc[i] = &emptymspan
 	}
@@ -128,7 +131,11 @@ func (c *mcache) refill(spc spanClass) {
 		if s.sweepgen != mheap_.sweepgen+3 {
 			throw("bad sweepgen in refill")
 		}
-		atomic.Store(&s.sweepgen, mheap_.sweepgen)
+		if go115NewMCentralImpl {
+			mheap_.central[spc].mcentral.uncacheSpan(s)
+		} else {
+			atomic.Store(&s.sweepgen, mheap_.sweepgen)
+		}
 	}
 
 	// Get a new cached span from the central lists.

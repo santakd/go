@@ -8,6 +8,7 @@ import (
 	"bytes"
 	"crypto"
 	"crypto/ecdsa"
+	"crypto/ed25519"
 	"crypto/rsa"
 	"crypto/subtle"
 	"crypto/x509"
@@ -15,7 +16,6 @@ import (
 	"fmt"
 	"io"
 	"net"
-	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -49,12 +49,12 @@ func (c *Conn) makeClientHello() (*clientHelloMsg, ecdheParameters, error) {
 		return nil, nil, errors.New("tls: NextProtos values too large")
 	}
 
-	supportedVersions := config.supportedVersions(true)
+	supportedVersions := config.supportedVersions()
 	if len(supportedVersions) == 0 {
 		return nil, nil, errors.New("tls: no supported versions satisfy MinVersion and MaxVersion")
 	}
 
-	clientHelloVersion := supportedVersions[0]
+	clientHelloVersion := config.maxSupportedVersion()
 	// The version at the beginning of the ClientHello was capped at TLS 1.2
 	// for compatibility reasons. The supported_versions extension is used
 	// to negotiate versions now. See RFC 8446, Section 4.2.1.
@@ -72,7 +72,6 @@ func (c *Conn) makeClientHello() (*clientHelloMsg, ecdheParameters, error) {
 		serverName:                   hostnameInSNI(config.ServerName),
 		supportedCurves:              config.curvePreferences(),
 		supportedPoints:              []uint8{pointFormatUncompressed},
-		nextProtoNeg:                 len(config.NextProtos) > 0,
 		secureRenegotiationSupported: true,
 		alpnProtocols:                config.NextProtos,
 		supportedVersions:            supportedVersions,
@@ -147,6 +146,7 @@ func (c *Conn) clientHandshake() (err error) {
 	if err != nil {
 		return err
 	}
+	c.serverName = hello.serverName
 
 	cacheKey, session, earlySecret, binderKey := c.loadSession(hello)
 	if cacheKey != "" && session != nil {
@@ -180,6 +180,18 @@ func (c *Conn) clientHandshake() (err error) {
 
 	if err := c.pickTLSVersion(serverHello); err != nil {
 		return err
+	}
+
+	// If we are negotiating a protocol version that's lower than what we
+	// support, check for the server downgrade canaries.
+	// See RFC 8446, Section 4.1.3.
+	maxVers := c.config.maxSupportedVersion()
+	tls12Downgrade := string(serverHello.random[24:]) == downgradeCanaryTLS12
+	tls11Downgrade := string(serverHello.random[24:]) == downgradeCanaryTLS11
+	if maxVers == VersionTLS13 && c.vers <= VersionTLS12 && (tls12Downgrade || tls11Downgrade) ||
+		maxVers == VersionTLS12 && c.vers <= VersionTLS11 && tls11Downgrade {
+		c.sendAlert(alertIllegalParameter)
+		return errors.New("tls: downgrade attempt detected, possibly due to a MitM attack or a broken middlebox")
 	}
 
 	if c.vers == VersionTLS13 {
@@ -339,7 +351,7 @@ func (c *Conn) pickTLSVersion(serverHello *serverHelloMsg) error {
 		peerVersion = serverHello.supportedVersion
 	}
 
-	vers, ok := c.config.mutualVersion(true, []uint16{peerVersion})
+	vers, ok := c.config.mutualVersion([]uint16{peerVersion})
 	if !ok {
 		c.sendAlert(alertProtocolVersion)
 		return fmt.Errorf("tls: server selected unsupported protocol version %x", peerVersion)
@@ -377,6 +389,7 @@ func (hs *clientHandshakeState) handshake() error {
 	hs.finishedHash.Write(hs.serverHello.marshal())
 
 	c.buffering = true
+	c.didResume = isResume
 	if isResume {
 		if err := hs.establishKeys(); err != nil {
 			return err
@@ -388,6 +401,15 @@ func (hs *clientHandshakeState) handshake() error {
 			return err
 		}
 		c.clientFinishedIsFirst = false
+		// Make sure the connection is still being verified whether or not this
+		// is a resumption. Resumptions currently don't reverify certificates so
+		// they don't call verifyServerCertificate. See Issue 31641.
+		if c.config.VerifyConnection != nil {
+			if err := c.config.VerifyConnection(c.connectionStateLocked()); err != nil {
+				c.sendAlert(alertBadCertificate)
+				return err
+			}
+		}
 		if err := hs.sendFinished(c.clientFinished[:]); err != nil {
 			return err
 		}
@@ -417,7 +439,6 @@ func (hs *clientHandshakeState) handshake() error {
 	}
 
 	c.ekm = ekmFromMasterSecret(c.vers, hs.suite, hs.masterSecret, hs.hello.random, hs.serverHello.random)
-	c.didResume = isResume
 	atomic.StoreUint32(&c.handshakeStatus, 1)
 
 	return nil
@@ -447,25 +468,6 @@ func (hs *clientHandshakeState) doFullHandshake() error {
 	}
 	hs.finishedHash.Write(certMsg.marshal())
 
-	if c.handshakes == 0 {
-		// If this is the first handshake on a connection, process and
-		// (optionally) verify the server's certificates.
-		if err := c.verifyServerCertificate(certMsg.certificates); err != nil {
-			return err
-		}
-	} else {
-		// This is a renegotiation handshake. We require that the
-		// server's identity (i.e. leaf certificate) is unchanged and
-		// thus any previous trust decision is still valid.
-		//
-		// See https://mitls.org/pages/attacks/3SHAKE for the
-		// motivation behind this requirement.
-		if !bytes.Equal(c.peerCertificates[0].Raw, certMsg.certificates[0]) {
-			c.sendAlert(alertBadCertificate)
-			return errors.New("tls: server's identity changed during renegotiation")
-		}
-	}
-
 	msg, err = c.readHandshake()
 	if err != nil {
 		return err
@@ -494,6 +496,25 @@ func (hs *clientHandshakeState) doFullHandshake() error {
 		}
 	}
 
+	if c.handshakes == 0 {
+		// If this is the first handshake on a connection, process and
+		// (optionally) verify the server's certificates.
+		if err := c.verifyServerCertificate(certMsg.certificates); err != nil {
+			return err
+		}
+	} else {
+		// This is a renegotiation handshake. We require that the
+		// server's identity (i.e. leaf certificate) is unchanged and
+		// thus any previous trust decision is still valid.
+		//
+		// See https://mitls.org/pages/attacks/3SHAKE for the
+		// motivation behind this requirement.
+		if !bytes.Equal(c.peerCertificates[0].Raw, certMsg.certificates[0]) {
+			c.sendAlert(alertBadCertificate)
+			return errors.New("tls: server's identity changed during renegotiation")
+		}
+	}
+
 	keyAgreement := hs.suite.ka(c.vers)
 
 	skx, ok := msg.(*serverKeyExchangeMsg)
@@ -518,7 +539,7 @@ func (hs *clientHandshakeState) doFullHandshake() error {
 		certRequested = true
 		hs.finishedHash.Write(certReq.marshal())
 
-		cri := certificateRequestInfoFromMsg(certReq)
+		cri := certificateRequestInfoFromMsg(c.vers, certReq)
 		if chainToSend, err = c.getClientCertificate(cri); err != nil {
 			c.sendAlert(alertInternalError)
 			return err
@@ -562,9 +583,7 @@ func (hs *clientHandshakeState) doFullHandshake() error {
 	}
 
 	if chainToSend != nil && len(chainToSend.Certificate) > 0 {
-		certVerify := &certificateVerifyMsg{
-			hasSignatureAlgorithm: c.vers >= VersionTLS12,
-		}
+		certVerify := &certificateVerifyMsg{}
 
 		key, ok := chainToSend.PrivateKey.(crypto.Signer)
 		if !ok {
@@ -572,25 +591,34 @@ func (hs *clientHandshakeState) doFullHandshake() error {
 			return fmt.Errorf("tls: client certificate private key of type %T does not implement crypto.Signer", chainToSend.PrivateKey)
 		}
 
-		signatureAlgorithm, sigType, hashFunc, err := pickSignatureAlgorithm(key.Public(), certReq.supportedSignatureAlgorithms, hs.hello.supportedSignatureAlgorithms, c.vers)
-		if err != nil {
-			c.sendAlert(alertInternalError)
-			return err
-		}
-		// SignatureAndHashAlgorithm was introduced in TLS 1.2.
-		if certVerify.hasSignatureAlgorithm {
+		var sigType uint8
+		var sigHash crypto.Hash
+		if c.vers >= VersionTLS12 {
+			signatureAlgorithm, err := selectSignatureScheme(c.vers, chainToSend, certReq.supportedSignatureAlgorithms)
+			if err != nil {
+				c.sendAlert(alertIllegalParameter)
+				return err
+			}
+			sigType, sigHash, err = typeAndHashFromSignatureScheme(signatureAlgorithm)
+			if err != nil {
+				return c.sendAlert(alertInternalError)
+			}
+			certVerify.hasSignatureAlgorithm = true
 			certVerify.signatureAlgorithm = signatureAlgorithm
+		} else {
+			sigType, sigHash, err = legacyTypeAndHashFromPublicKey(key.Public())
+			if err != nil {
+				c.sendAlert(alertIllegalParameter)
+				return err
+			}
 		}
-		digest, err := hs.finishedHash.hashForClientCertificate(sigType, hashFunc, hs.masterSecret)
-		if err != nil {
-			c.sendAlert(alertInternalError)
-			return err
-		}
-		signOpts := crypto.SignerOpts(hashFunc)
+
+		signed := hs.finishedHash.hashForClientCertificate(sigType, sigHash, hs.masterSecret)
+		signOpts := crypto.SignerOpts(sigHash)
 		if sigType == signatureRSAPSS {
-			signOpts = &rsa.PSSOptions{SaltLength: rsa.PSSSaltLengthEqualsHash, Hash: hashFunc}
+			signOpts = &rsa.PSSOptions{SaltLength: rsa.PSSSaltLengthEqualsHash, Hash: sigHash}
 		}
-		certVerify.signature, err = key.Sign(c.config.rand(), digest, signOpts)
+		certVerify.signature, err = key.Sign(c.config.rand(), signed, signOpts)
 		if err != nil {
 			c.sendAlert(alertInternalError)
 			return err
@@ -672,24 +700,12 @@ func (hs *clientHandshakeState) processServerHello() (bool, error) {
 		}
 	}
 
-	clientDidNPN := hs.hello.nextProtoNeg
 	clientDidALPN := len(hs.hello.alpnProtocols) > 0
-	serverHasNPN := hs.serverHello.nextProtoNeg
 	serverHasALPN := len(hs.serverHello.alpnProtocol) > 0
-
-	if !clientDidNPN && serverHasNPN {
-		c.sendAlert(alertHandshakeFailure)
-		return false, errors.New("tls: server advertised unrequested NPN extension")
-	}
 
 	if !clientDidALPN && serverHasALPN {
 		c.sendAlert(alertHandshakeFailure)
 		return false, errors.New("tls: server advertised unrequested ALPN extension")
-	}
-
-	if serverHasNPN && serverHasALPN {
-		c.sendAlert(alertHandshakeFailure)
-		return false, errors.New("tls: server advertised both NPN and ALPN extensions")
 	}
 
 	if serverHasALPN {
@@ -783,18 +799,6 @@ func (hs *clientHandshakeState) sendFinished(out []byte) error {
 	if _, err := c.writeRecord(recordTypeChangeCipherSpec, []byte{1}); err != nil {
 		return err
 	}
-	if hs.serverHello.nextProtoNeg {
-		nextProto := new(nextProtoMsg)
-		proto, fallback := mutualProtocol(c.config.NextProtos, hs.serverHello.nextProtos)
-		nextProto.proto = proto
-		c.clientProtocol = proto
-		c.clientProtocolFallback = fallback
-
-		hs.finishedHash.Write(nextProto.marshal())
-		if _, err := c.writeRecord(recordTypeHandshake, nextProto.marshal()); err != nil {
-			return err
-		}
-	}
 
 	finished := new(finishedMsg)
 	finished.verifyData = hs.finishedHash.clientSum(hs.masterSecret)
@@ -837,15 +841,8 @@ func (c *Conn) verifyServerCertificate(certificates [][]byte) error {
 		}
 	}
 
-	if c.config.VerifyPeerCertificate != nil {
-		if err := c.config.VerifyPeerCertificate(certificates, c.verifiedChains); err != nil {
-			c.sendAlert(alertBadCertificate)
-			return err
-		}
-	}
-
 	switch certs[0].PublicKey.(type) {
-	case *rsa.PublicKey, *ecdsa.PublicKey:
+	case *rsa.PublicKey, *ecdsa.PublicKey, ed25519.PublicKey:
 		break
 	default:
 		c.sendAlert(alertUnsupportedCertificate)
@@ -854,59 +851,76 @@ func (c *Conn) verifyServerCertificate(certificates [][]byte) error {
 
 	c.peerCertificates = certs
 
+	if c.config.VerifyPeerCertificate != nil {
+		if err := c.config.VerifyPeerCertificate(certificates, c.verifiedChains); err != nil {
+			c.sendAlert(alertBadCertificate)
+			return err
+		}
+	}
+
+	if c.config.VerifyConnection != nil {
+		if err := c.config.VerifyConnection(c.connectionStateLocked()); err != nil {
+			c.sendAlert(alertBadCertificate)
+			return err
+		}
+	}
+
 	return nil
 }
 
-// tls11SignatureSchemes contains the signature schemes that we synthesise for
-// a TLS <= 1.1 connection, based on the supported certificate types.
-var (
-	tls11SignatureSchemes      = []SignatureScheme{ECDSAWithP256AndSHA256, ECDSAWithP384AndSHA384, ECDSAWithP521AndSHA512, PKCS1WithSHA256, PKCS1WithSHA384, PKCS1WithSHA512, PKCS1WithSHA1}
-	tls11SignatureSchemesECDSA = tls11SignatureSchemes[:3]
-	tls11SignatureSchemesRSA   = tls11SignatureSchemes[3:]
-)
-
 // certificateRequestInfoFromMsg generates a CertificateRequestInfo from a TLS
 // <= 1.2 CertificateRequest, making an effort to fill in missing information.
-func certificateRequestInfoFromMsg(certReq *certificateRequestMsg) *CertificateRequestInfo {
-	var rsaAvail, ecdsaAvail bool
+func certificateRequestInfoFromMsg(vers uint16, certReq *certificateRequestMsg) *CertificateRequestInfo {
+	cri := &CertificateRequestInfo{
+		AcceptableCAs: certReq.certificateAuthorities,
+		Version:       vers,
+	}
+
+	var rsaAvail, ecAvail bool
 	for _, certType := range certReq.certificateTypes {
 		switch certType {
 		case certTypeRSASign:
 			rsaAvail = true
 		case certTypeECDSASign:
-			ecdsaAvail = true
+			ecAvail = true
 		}
 	}
 
-	cri := &CertificateRequestInfo{
-		AcceptableCAs: certReq.certificateAuthorities,
-	}
-
 	if !certReq.hasSignatureAlgorithm {
-		// Prior to TLS 1.2, the signature schemes were not
-		// included in the certificate request message. In this
-		// case we use a plausible list based on the acceptable
-		// certificate types.
+		// Prior to TLS 1.2, signature schemes did not exist. In this case we
+		// make up a list based on the acceptable certificate types, to help
+		// GetClientCertificate and SupportsCertificate select the right certificate.
+		// The hash part of the SignatureScheme is a lie here, because
+		// TLS 1.0 and 1.1 always use MD5+SHA1 for RSA and SHA1 for ECDSA.
 		switch {
-		case rsaAvail && ecdsaAvail:
-			cri.SignatureSchemes = tls11SignatureSchemes
+		case rsaAvail && ecAvail:
+			cri.SignatureSchemes = []SignatureScheme{
+				ECDSAWithP256AndSHA256, ECDSAWithP384AndSHA384, ECDSAWithP521AndSHA512,
+				PKCS1WithSHA256, PKCS1WithSHA384, PKCS1WithSHA512, PKCS1WithSHA1,
+			}
 		case rsaAvail:
-			cri.SignatureSchemes = tls11SignatureSchemesRSA
-		case ecdsaAvail:
-			cri.SignatureSchemes = tls11SignatureSchemesECDSA
+			cri.SignatureSchemes = []SignatureScheme{
+				PKCS1WithSHA256, PKCS1WithSHA384, PKCS1WithSHA512, PKCS1WithSHA1,
+			}
+		case ecAvail:
+			cri.SignatureSchemes = []SignatureScheme{
+				ECDSAWithP256AndSHA256, ECDSAWithP384AndSHA384, ECDSAWithP521AndSHA512,
+			}
 		}
 		return cri
 	}
 
-	// In TLS 1.2, the signature schemes apply to both the certificate chain and
-	// the leaf key, while the certificate types only apply to the leaf key.
+	// Filter the signature schemes based on the certificate types.
 	// See RFC 5246, Section 7.4.4 (where it calls this "somewhat complicated").
-	// Filter the signature schemes based on the certificate type.
 	cri.SignatureSchemes = make([]SignatureScheme, 0, len(certReq.supportedSignatureAlgorithms))
 	for _, sigScheme := range certReq.supportedSignatureAlgorithms {
-		switch signatureFromSignatureScheme(sigScheme) {
-		case signatureECDSA:
-			if ecdsaAvail {
+		sigType, _, err := typeAndHashFromSignatureScheme(sigScheme)
+		if err != nil {
+			continue
+		}
+		switch sigType {
+		case signatureECDSA, signatureEd25519:
+			if ecAvail {
 				cri.SignatureSchemes = append(cri.SignatureSchemes, sigScheme)
 			}
 		case signatureRSAPSS, signaturePKCS1v15:
@@ -924,43 +938,11 @@ func (c *Conn) getClientCertificate(cri *CertificateRequestInfo) (*Certificate, 
 		return c.config.GetClientCertificate(cri)
 	}
 
-	// We need to search our list of client certs for one
-	// where SignatureAlgorithm is acceptable to the server and the
-	// Issuer is in AcceptableCAs.
-	for i, chain := range c.config.Certificates {
-		sigOK := false
-		for _, alg := range signatureSchemesForCertificate(c.vers, &chain) {
-			if isSupportedSignatureAlgorithm(alg, cri.SignatureSchemes) {
-				sigOK = true
-				break
-			}
-		}
-		if !sigOK {
+	for _, chain := range c.config.Certificates {
+		if err := cri.SupportsCertificate(&chain); err != nil {
 			continue
 		}
-
-		if len(cri.AcceptableCAs) == 0 {
-			return &chain, nil
-		}
-
-		for j, cert := range chain.Certificate {
-			x509Cert := chain.Leaf
-			// Parse the certificate if this isn't the leaf node, or if
-			// chain.Leaf was nil.
-			if j != 0 || x509Cert == nil {
-				var err error
-				if x509Cert, err = x509.ParseCertificate(cert); err != nil {
-					c.sendAlert(alertInternalError)
-					return nil, errors.New("tls: failed to parse configured certificate chain #" + strconv.Itoa(i) + ": " + err.Error())
-				}
-			}
-
-			for _, ca := range cri.AcceptableCAs {
-				if bytes.Equal(x509Cert.RawIssuer, ca) {
-					return &chain, nil
-				}
-			}
-		}
+		return &chain, nil
 	}
 
 	// No acceptable certificate found. Don't send a certificate.
@@ -992,7 +974,7 @@ func mutualProtocol(protos, preferenceProtos []string) (string, bool) {
 	return protos[0], true
 }
 
-// hostnameInSNI converts name into an approriate hostname for SNI.
+// hostnameInSNI converts name into an appropriate hostname for SNI.
 // Literal IP addresses and absolute FQDNs are not permitted as SNI values.
 // See RFC 6066, Section 3.
 func hostnameInSNI(name string) string {

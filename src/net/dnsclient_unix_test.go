@@ -10,7 +10,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"internal/poll"
 	"io/ioutil"
 	"os"
 	"path"
@@ -173,7 +172,7 @@ func TestAvoidDNSName(t *testing.T) {
 
 		// Without stuff before onion/local, they're fine to
 		// use DNS. With a search path,
-		// "onion.vegegtables.com" can use DNS. Without a
+		// "onion.vegetables.com" can use DNS. Without a
 		// search path (or with a trailing dot), the queries
 		// are just kinda useless, but don't reveal anything
 		// private.
@@ -480,7 +479,7 @@ func TestGoLookupIPWithResolverConfig(t *testing.T) {
 			break
 		default:
 			time.Sleep(10 * time.Millisecond)
-			return dnsmessage.Message{}, poll.ErrTimeout
+			return dnsmessage.Message{}, os.ErrDeadlineExceeded
 		}
 		r := dnsmessage.Message{
 			Header: dnsmessage.Header{
@@ -589,6 +588,8 @@ func TestGoLookupIPOrderFallbackToFile(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer conf.teardown()
+
 	if err := conf.writeAndUpdate([]string{}); err != nil {
 		t.Fatal(err)
 	}
@@ -620,7 +621,6 @@ func TestGoLookupIPOrderFallbackToFile(t *testing.T) {
 			t.Errorf("%s: address doesn't match expectation. got %v, want %v", name, got, want)
 		}
 	}
-	defer conf.teardown()
 }
 
 // Issue 12712.
@@ -992,7 +992,7 @@ func TestRetryTimeout(t *testing.T) {
 		if s == "192.0.2.1:53" {
 			deadline0 = deadline
 			time.Sleep(10 * time.Millisecond)
-			return dnsmessage.Message{}, poll.ErrTimeout
+			return dnsmessage.Message{}, os.ErrDeadlineExceeded
 		}
 
 		if deadline.Equal(deadline0) {
@@ -1130,7 +1130,7 @@ func TestStrictErrorsLookupIP(t *testing.T) {
 	}
 	makeTimeout := func() error {
 		return &DNSError{
-			Err:       poll.ErrTimeout.Error(),
+			Err:       os.ErrDeadlineExceeded.Error(),
 			Name:      name,
 			Server:    server,
 			IsTimeout: true,
@@ -1246,7 +1246,7 @@ func TestStrictErrorsLookupIP(t *testing.T) {
 					Questions: q.Questions,
 				}, nil
 			case resolveTimeout:
-				return dnsmessage.Message{}, poll.ErrTimeout
+				return dnsmessage.Message{}, os.ErrDeadlineExceeded
 			default:
 				t.Fatal("Impossible resolveWhich")
 			}
@@ -1371,7 +1371,7 @@ func TestStrictErrorsLookupTXT(t *testing.T) {
 
 		switch q.Questions[0].Name.String() {
 		case searchX:
-			return dnsmessage.Message{}, poll.ErrTimeout
+			return dnsmessage.Message{}, os.ErrDeadlineExceeded
 		case searchY:
 			return mockTXTResponse(q), nil
 		default:
@@ -1386,7 +1386,7 @@ func TestStrictErrorsLookupTXT(t *testing.T) {
 		var wantRRs int
 		if strict {
 			wantErr = &DNSError{
-				Err:       poll.ErrTimeout.Error(),
+				Err:       os.ErrDeadlineExceeded.Error(),
 				Name:      name,
 				Server:    server,
 				IsTimeout: true,
@@ -1414,7 +1414,7 @@ func TestDNSGoroutineRace(t *testing.T) {
 
 	fake := fakeDNSServer{rh: func(n, s string, q dnsmessage.Message, t time.Time) (dnsmessage.Message, error) {
 		time.Sleep(10 * time.Microsecond)
-		return dnsmessage.Message{}, poll.ErrTimeout
+		return dnsmessage.Message{}, os.ErrDeadlineExceeded
 	}}
 	r := Resolver{PreferGo: true, Dial: fake.DialContext}
 
@@ -1750,5 +1750,52 @@ func TestDNSUseTCP(t *testing.T) {
 	_, _, err := r.exchange(ctx, "0.0.0.0", mustQuestion("com.", dnsmessage.TypeALL, dnsmessage.ClassINET), time.Second, useTCPOnly)
 	if err != nil {
 		t.Fatal("exchange failed:", err)
+	}
+}
+
+// Issue 34660: PTR response with non-PTR answers should ignore non-PTR
+func TestPTRandNonPTR(t *testing.T) {
+	fake := fakeDNSServer{
+		rh: func(n, _ string, q dnsmessage.Message, _ time.Time) (dnsmessage.Message, error) {
+			r := dnsmessage.Message{
+				Header: dnsmessage.Header{
+					ID:       q.Header.ID,
+					Response: true,
+					RCode:    dnsmessage.RCodeSuccess,
+				},
+				Questions: q.Questions,
+				Answers: []dnsmessage.Resource{
+					{
+						Header: dnsmessage.ResourceHeader{
+							Name:  q.Questions[0].Name,
+							Type:  dnsmessage.TypePTR,
+							Class: dnsmessage.ClassINET,
+						},
+						Body: &dnsmessage.PTRResource{
+							PTR: dnsmessage.MustNewName("golang.org."),
+						},
+					},
+					{
+						Header: dnsmessage.ResourceHeader{
+							Name:  q.Questions[0].Name,
+							Type:  dnsmessage.TypeTXT,
+							Class: dnsmessage.ClassINET,
+						},
+						Body: &dnsmessage.TXTResource{
+							TXT: []string{"PTR 8 6 60 ..."}, // fake RRSIG
+						},
+					},
+				},
+			}
+			return r, nil
+		},
+	}
+	r := Resolver{PreferGo: true, Dial: fake.DialContext}
+	names, err := r.lookupAddr(context.Background(), "192.0.2.123")
+	if err != nil {
+		t.Fatalf("LookupAddr: %v", err)
+	}
+	if want := []string{"golang.org."}; !reflect.DeepEqual(names, want) {
+		t.Errorf("names = %q; want %q", names, want)
 	}
 }

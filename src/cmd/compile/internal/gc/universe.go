@@ -11,8 +11,6 @@ import "cmd/compile/internal/types"
 // builtinpkg is a fake package that declares the universe block.
 var builtinpkg *types.Pkg
 
-var itable *types.Type // distinguished *byte
-
 var basicTypes = [...]struct {
 	name  string
 	etype types.EType
@@ -68,7 +66,7 @@ var builtinFuncs = [...]struct {
 // isBuiltinFuncName reports whether name matches a builtin function
 // name.
 func isBuiltinFuncName(name string) bool {
-	for _, fn := range builtinFuncs {
+	for _, fn := range &builtinFuncs {
 		if fn.name == name {
 			return true
 		}
@@ -94,7 +92,7 @@ func initUniverse() {
 
 // lexinit initializes known symbols and the basic types.
 func lexinit() {
-	for _, s := range basicTypes {
+	for _, s := range &basicTypes {
 		etype := s.etype
 		if int(etype) >= len(types.Types) {
 			Fatalf("lexinit: %s bad etype", s.name)
@@ -113,13 +111,13 @@ func lexinit() {
 		asNode(s2.Def).Name = new(Name)
 	}
 
-	for _, s := range builtinFuncs {
+	for _, s := range &builtinFuncs {
 		s2 := builtinpkg.Lookup(s.name)
 		s2.Def = asTypesNode(newname(s2))
 		asNode(s2.Def).SetSubOp(s.op)
 	}
 
-	for _, s := range unsafeFuncs {
+	for _, s := range &unsafeFuncs {
 		s2 := unsafepkg.Lookup(s.name)
 		s2.Def = asTypesNode(newname(s2))
 		asNode(s2.Def).SetSubOp(s.op)
@@ -336,14 +334,7 @@ func typeinit() {
 	maxfltval[TCOMPLEX128] = maxfltval[TFLOAT64]
 	minfltval[TCOMPLEX128] = minfltval[TFLOAT64]
 
-	// for walk to use in error messages
-	types.Types[TFUNC] = functype(nil, nil, nil)
-
-	// types used in front end
-	// types.Types[TNIL] got set early in lexinit
-	types.Types[TIDEAL] = types.New(TIDEAL)
-
-	types.Types[TINTER] = types.New(TINTER)
+	types.Types[TINTER] = types.New(TINTER) // empty interface
 
 	// simple aliases
 	simtype[TMAP] = TPTR
@@ -351,18 +342,16 @@ func typeinit() {
 	simtype[TFUNC] = TPTR
 	simtype[TUNSAFEPTR] = TPTR
 
-	array_array = int(Rnd(0, int64(Widthptr)))
-	array_nel = int(Rnd(int64(array_array)+int64(Widthptr), int64(Widthptr)))
-	array_cap = int(Rnd(int64(array_nel)+int64(Widthptr), int64(Widthptr)))
-	sizeof_Array = int(Rnd(int64(array_cap)+int64(Widthptr), int64(Widthptr)))
+	slicePtrOffset = 0
+	sliceLenOffset = Rnd(slicePtrOffset+int64(Widthptr), int64(Widthptr))
+	sliceCapOffset = Rnd(sliceLenOffset+int64(Widthptr), int64(Widthptr))
+	sizeofSlice = Rnd(sliceCapOffset+int64(Widthptr), int64(Widthptr))
 
 	// string is same as slice wo the cap
-	sizeof_String = int(Rnd(int64(array_nel)+int64(Widthptr), int64(Widthptr)))
+	sizeofString = Rnd(sliceLenOffset+int64(Widthptr), int64(Widthptr))
 
 	dowidth(types.Types[TSTRING])
 	dowidth(types.Idealstring)
-
-	itable = types.NewPtr(types.Types[TUINT8])
 }
 
 func makeErrorInterface() *types.Type {
@@ -413,7 +402,7 @@ func lexinit1() {
 	dowidth(types.Runetype)
 
 	// backend-dependent builtin types (e.g. int).
-	for _, s := range typedefs {
+	for _, s := range &typedefs {
 		s1 := builtinpkg.Lookup(s.name)
 
 		sameas := s.sameas32

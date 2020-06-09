@@ -636,6 +636,11 @@ var readResponseCloseInMiddleTests = []struct {
 	{true, true},
 }
 
+type readerAndCloser struct {
+	io.Reader
+	io.Closer
+}
+
 // TestReadResponseCloseInMiddle tests that closing a body after
 // reading only part of its contents advances the read to the end of
 // the request, right up until the next request.
@@ -729,6 +734,7 @@ func TestReadResponseCloseInMiddle(t *testing.T) {
 }
 
 func diff(t *testing.T, prefix string, have, want interface{}) {
+	t.Helper()
 	hv := reflect.ValueOf(have).Elem()
 	wv := reflect.ValueOf(want).Elem()
 	if hv.Type() != wv.Type() {

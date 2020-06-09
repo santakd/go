@@ -624,7 +624,7 @@ if it has already been declared, provided:
 <li>this declaration is in the same scope as the existing declaration of <code>v</code>
 (if <code>v</code> is already declared in an outer scope, the declaration will create a new variable §),</li>
 <li>the corresponding value in the initialization is assignable to <code>v</code>, and</li>
-<li>there is at least one other variable in the declaration that is being declared anew.</li>
+<li>there is at least one other variable that is created by the declaration.</li>
 </ul>
 
 <p>
@@ -2282,8 +2282,8 @@ The  <code>crypto/cipher</code> interfaces look like this:
 <pre>
 type Block interface {
     BlockSize() int
-    Encrypt(src, dst []byte)
-    Decrypt(src, dst []byte)
+    Encrypt(dst, src []byte)
+    Decrypt(dst, src []byte)
 }
 
 type Stream interface {
@@ -2695,8 +2695,7 @@ type ReadWriter interface {
 <p>
 This says just what it looks like: A <code>ReadWriter</code> can do
 what a <code>Reader</code> does <em>and</em> what a <code>Writer</code>
-does; it is a union of the embedded interfaces (which must be disjoint
-sets of methods).
+does; it is a union of the embedded interfaces.
 Only interfaces can be embedded within interfaces.
 </p>
 <p>

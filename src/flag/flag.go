@@ -9,9 +9,9 @@
 
 	Define flags using flag.String(), Bool(), Int(), etc.
 
-	This declares an integer flag, -flagname, stored in the pointer ip, with type *int.
+	This declares an integer flag, -n, stored in the pointer nFlag, with type *int:
 		import "flag"
-		var ip = flag.Int("flagname", 1234, "help message for flagname")
+		var nFlag = flag.Int("n", 1234, "help message for flag n")
 	If you like, you can bind the flag to a variable using the Var() functions.
 		var flagvar int
 		func init() {
@@ -308,12 +308,15 @@ type ErrorHandling int
 // These constants cause FlagSet.Parse to behave as described if the parse fails.
 const (
 	ContinueOnError ErrorHandling = iota // Return a descriptive error.
-	ExitOnError                          // Call os.Exit(2).
+	ExitOnError                          // Call os.Exit(2) or for -h/-help Exit(0).
 	PanicOnError                         // Call panic with a descriptive error.
 )
 
 // A FlagSet represents a set of defined flags. The zero value of a FlagSet
 // has no name and has ContinueOnError error handling.
+//
+// Flag names must be unique within a FlagSet. An attempt to define a flag whose
+// name is already in use will cause a panic.
 type FlagSet struct {
 	// Usage is the function called when an error occurs while parsing flags.
 	// The field is a function (not a method) that may be changed to point to
@@ -328,7 +331,7 @@ type FlagSet struct {
 	formal        map[string]*Flag
 	args          []string // arguments after flags
 	errorHandling ErrorHandling
-	output        io.Writer // nil means stderr; use out() accessor
+	output        io.Writer // nil means stderr; use Output() accessor
 }
 
 // A Flag represents the state of a flag.
@@ -976,6 +979,9 @@ func (f *FlagSet) Parse(arguments []string) error {
 		case ContinueOnError:
 			return err
 		case ExitOnError:
+			if err == ErrHelp {
+				os.Exit(0)
+			}
 			os.Exit(2)
 		case PanicOnError:
 			panic(err)

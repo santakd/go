@@ -8,13 +8,16 @@ package obj
 
 import (
 	"bufio"
+	"cmd/internal/bio"
 	"cmd/internal/dwarf"
 	"cmd/internal/objabi"
 	"cmd/internal/sys"
 	"fmt"
+	"io"
 	"log"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 )
 
@@ -30,9 +33,10 @@ type objWriter struct {
 	nData     int
 	nReloc    int
 	nPcdata   int
-	nAutom    int
 	nFuncdata int
 	nFile     int
+
+	pkgpath string // the package import path (escaped), "" if unknown
 }
 
 func (w *objWriter) addLengths(s *LSym) {
@@ -57,7 +61,6 @@ func (w *objWriter) addLengths(s *LSym) {
 	w.nData += data
 	w.nPcdata += len(pc.Pcdata)
 
-	w.nAutom += len(s.Func.Autom)
 	w.nFuncdata += len(pc.Funcdataoff)
 	w.nFile += len(pc.File)
 }
@@ -66,32 +69,47 @@ func (w *objWriter) writeLengths() {
 	w.writeInt(int64(w.nData))
 	w.writeInt(int64(w.nReloc))
 	w.writeInt(int64(w.nPcdata))
-	w.writeInt(int64(w.nAutom))
+	w.writeInt(int64(0)) // TODO: remove at next object file rev
 	w.writeInt(int64(w.nFuncdata))
 	w.writeInt(int64(w.nFile))
 }
 
-func newObjWriter(ctxt *Link, b *bufio.Writer) *objWriter {
+func newObjWriter(ctxt *Link, b *bufio.Writer, pkgpath string) *objWriter {
 	return &objWriter{
-		ctxt: ctxt,
-		wr:   b,
+		ctxt:    ctxt,
+		wr:      b,
+		pkgpath: objabi.PathToPrefix(pkgpath),
 	}
 }
 
-func WriteObjFile(ctxt *Link, b *bufio.Writer) {
-	w := newObjWriter(ctxt, b)
+func WriteObjFile(ctxt *Link, bout *bio.Writer, pkgpath string) {
+	if ctxt.Flag_go115newobj {
+		WriteObjFile2(ctxt, bout, pkgpath)
+		return
+	}
+
+	b := bout.Writer
+	w := newObjWriter(ctxt, b, pkgpath)
 
 	// Magic header
-	w.wr.WriteString("\x00go112ld")
+	w.wr.WriteString("\x00go114ld")
 
 	// Version
 	w.wr.WriteByte(1)
 
 	// Autolib
-	for _, pkg := range ctxt.Imports {
-		w.writeString(pkg)
+	for _, p := range ctxt.Imports {
+		w.writeString(p.Pkg)
+		// This object format ignores p.Fingerprint.
 	}
 	w.writeString("")
+
+	// DWARF File Table
+	fileTable := ctxt.PosTable.DebugLinesFileTable()
+	w.writeInt(int64(len(fileTable)))
+	for _, str := range fileTable {
+		w.writeString(filepath.ToSlash(str))
+	}
 
 	// Symbol references
 	for _, s := range ctxt.Text {
@@ -104,7 +122,7 @@ func WriteObjFile(ctxt *Link, b *bufio.Writer) {
 		// As they are created during Progedit, two symbols can be switched between
 		// two different compilations. Therefore, BuildID will be different.
 		// TODO: find a better place and optimize to only sort TOC symbols
-		SortSlice(ctxt.Data, func(i, j int) bool {
+		sort.Slice(ctxt.Data, func(i, j int) bool {
 			return ctxt.Data[i].Name < ctxt.Data[j].Name
 		})
 	}
@@ -157,7 +175,7 @@ func WriteObjFile(ctxt *Link, b *bufio.Writer) {
 	}
 
 	// Magic footer
-	w.wr.WriteString("\xffgo112ld")
+	w.wr.WriteString("\xffgo114ld")
 }
 
 // Symbols are prefixed so their content doesn't get confused with the magic footer.
@@ -170,6 +188,10 @@ func (w *objWriter) writeRef(s *LSym, isPath bool) {
 	w.wr.WriteByte(symPrefix)
 	if isPath {
 		w.writeString(filepath.ToSlash(s.Name))
+	} else if w.pkgpath != "" {
+		// w.pkgpath is already escaped.
+		n := strings.Replace(s.Name, "\"\".", w.pkgpath+".", -1)
+		w.writeString(n)
 	} else {
 		w.writeString(s.Name)
 	}
@@ -191,10 +213,6 @@ func (w *objWriter) writeRefs(s *LSym) {
 	}
 
 	if s.Type == objabi.STEXT {
-		for _, a := range s.Func.Autom {
-			w.writeRef(a.Asym, false)
-			w.writeRef(a.Gotype, false)
-		}
 		pc := &s.Func.Pcln
 		for _, d := range pc.Funcdata {
 			w.writeRef(d, false)
@@ -212,9 +230,12 @@ func (w *objWriter) writeRefs(s *LSym) {
 	}
 }
 
-func (w *objWriter) writeSymDebug(s *LSym) {
-	ctxt := w.ctxt
-	fmt.Fprintf(ctxt.Bso, "%s ", s.Name)
+func (ctxt *Link) writeSymDebug(s *LSym) {
+	ctxt.writeSymDebugNamed(s, s.Name)
+}
+
+func (ctxt *Link) writeSymDebugNamed(s *LSym, name string) {
+	fmt.Fprintf(ctxt.Bso, "%s ", name)
 	if s.Type != 0 {
 		fmt.Fprintf(ctxt.Bso, "%v ", s.Type)
 	}
@@ -243,13 +264,13 @@ func (w *objWriter) writeSymDebug(s *LSym) {
 	fmt.Fprintf(ctxt.Bso, "\n")
 	if s.Type == objabi.STEXT {
 		for p := s.Func.Text; p != nil; p = p.Link {
-			var s string
+			fmt.Fprintf(ctxt.Bso, "\t%#04x ", uint(int(p.Pc)))
 			if ctxt.Debugasm > 1 {
-				s = p.String()
+				io.WriteString(ctxt.Bso, p.String())
 			} else {
-				s = p.InnermostString()
+				p.InnermostString(ctxt.Bso)
 			}
-			fmt.Fprintf(ctxt.Bso, "\t%#04x %s\n", uint(int(p.Pc)), s)
+			fmt.Fprintln(ctxt.Bso)
 		}
 	}
 	for i := 0; i < len(s.P); i += 16 {
@@ -264,11 +285,11 @@ func (w *objWriter) writeSymDebug(s *LSym) {
 		fmt.Fprintf(ctxt.Bso, "  ")
 		for j = i; j < i+16 && j < len(s.P); j++ {
 			c := int(s.P[j])
+			b := byte('.')
 			if ' ' <= c && c <= 0x7e {
-				fmt.Fprintf(ctxt.Bso, "%c", c)
-			} else {
-				fmt.Fprintf(ctxt.Bso, ".")
+				b = byte(c)
 			}
+			ctxt.Bso.WriteByte(b)
 		}
 
 		fmt.Fprintf(ctxt.Bso, "\n")
@@ -293,7 +314,7 @@ func (w *objWriter) writeSymDebug(s *LSym) {
 func (w *objWriter) writeSym(s *LSym) {
 	ctxt := w.ctxt
 	if ctxt.Debugasm > 0 {
-		w.writeSymDebug(s)
+		w.ctxt.writeSymDebug(s)
 	}
 
 	w.wr.WriteByte(symPrefix)
@@ -331,6 +352,7 @@ func (w *objWriter) writeSym(s *LSym) {
 
 	w.writeInt(int64(s.Func.Args))
 	w.writeInt(int64(s.Func.Locals))
+	w.writeInt(int64(s.Func.Align))
 	w.writeBool(s.NoSplit())
 	flags = int64(0)
 	if s.Leaf() {
@@ -349,21 +371,7 @@ func (w *objWriter) writeSym(s *LSym) {
 		flags |= 1 << 4
 	}
 	w.writeInt(flags)
-	w.writeInt(int64(len(s.Func.Autom)))
-	for _, a := range s.Func.Autom {
-		w.writeRefIndex(a.Asym)
-		w.writeInt(int64(a.Aoffset))
-		if a.Name == NAME_AUTO {
-			w.writeInt(objabi.A_AUTO)
-		} else if a.Name == NAME_PARAM {
-			w.writeInt(objabi.A_PARAM)
-		} else if a.Name == NAME_DELETED_AUTO {
-			w.writeInt(objabi.A_DELETED_AUTO)
-		} else {
-			log.Fatalf("%s: invalid local variable type %d", s.Name, a.Name)
-		}
-		w.writeRefIndex(a.Gotype)
-	}
+	w.writeInt(int64(0)) // TODO: remove at next object file rev
 
 	pc := &s.Func.Pcln
 	w.writeInt(int64(len(pc.Pcsp.P)))
@@ -452,6 +460,13 @@ func (c dwCtxt) AddInt(s dwarf.Sym, size int, i int64) {
 	ls := s.(*LSym)
 	ls.WriteInt(c.Link, ls.Size, size, i)
 }
+func (c dwCtxt) AddUint16(s dwarf.Sym, i uint16) {
+	c.AddInt(s, 2, int64(i))
+}
+func (c dwCtxt) AddUint8(s dwarf.Sym, i uint8) {
+	b := []byte{byte(i)}
+	c.AddBytes(s, b)
+}
 func (c dwCtxt) AddBytes(s dwarf.Sym, b []byte) {
 	ls := s.(*LSym)
 	ls.WriteBytes(c.Link, ls.Size, b)
@@ -491,12 +506,21 @@ func (c dwCtxt) AddDWARFAddrSectionOffset(s dwarf.Sym, t interface{}, ofs int64)
 	r := &ls.R[len(ls.R)-1]
 	r.Type = objabi.R_DWARFSECREF
 }
+
 func (c dwCtxt) AddFileRef(s dwarf.Sym, f interface{}) {
 	ls := s.(*LSym)
 	rsym := f.(*LSym)
-	ls.WriteAddr(c.Link, ls.Size, 4, rsym, 0)
-	r := &ls.R[len(ls.R)-1]
-	r.Type = objabi.R_DWARFFILEREF
+	if c.Link.Flag_go115newobj {
+		fidx := c.Link.PosTable.FileIndex(rsym.Name)
+		// Note the +1 here -- the value we're writing is going to be an
+		// index into the DWARF line table file section, whose entries
+		// are numbered starting at 1, not 0.
+		ls.WriteInt(c.Link, ls.Size, 4, int64(fidx+1))
+	} else {
+		ls.WriteAddr(c.Link, ls.Size, 4, rsym, 0)
+		r := &ls.R[len(ls.R)-1]
+		r.Type = objabi.R_DWARFFILEREF
+	}
 }
 
 func (c dwCtxt) CurrentOffset(s dwarf.Sym) int64 {
@@ -529,26 +553,42 @@ func isDwarf64(ctxt *Link) bool {
 	return ctxt.Headtype == objabi.Haix
 }
 
-func (ctxt *Link) dwarfSym(s *LSym) (dwarfInfoSym, dwarfLocSym, dwarfRangesSym, dwarfAbsFnSym, dwarfIsStmtSym *LSym) {
+func (ctxt *Link) dwarfSym(s *LSym) (dwarfInfoSym, dwarfLocSym, dwarfRangesSym, dwarfAbsFnSym, dwarfDebugLines *LSym) {
 	if s.Type != objabi.STEXT {
 		ctxt.Diag("dwarfSym of non-TEXT %v", s)
 	}
 	if s.Func.dwarfInfoSym == nil {
-		s.Func.dwarfInfoSym = ctxt.LookupDerived(s, dwarf.InfoPrefix+s.Name)
-		if ctxt.Flag_locationlists {
-			s.Func.dwarfLocSym = ctxt.LookupDerived(s, dwarf.LocPrefix+s.Name)
+		if ctxt.Flag_go115newobj {
+			s.Func.dwarfInfoSym = &LSym{
+				Type: objabi.SDWARFINFO,
+			}
+			if ctxt.Flag_locationlists {
+				s.Func.dwarfLocSym = &LSym{
+					Type: objabi.SDWARFLOC,
+				}
+			}
+			s.Func.dwarfRangesSym = &LSym{
+				Type: objabi.SDWARFRANGE,
+			}
+			s.Func.dwarfDebugLinesSym = &LSym{
+				Type: objabi.SDWARFLINES,
+			}
+		} else {
+			s.Func.dwarfInfoSym = ctxt.LookupDerived(s, dwarf.InfoPrefix+s.Name)
+			if ctxt.Flag_locationlists {
+				s.Func.dwarfLocSym = ctxt.LookupDerived(s, dwarf.LocPrefix+s.Name)
+			}
+			s.Func.dwarfRangesSym = ctxt.LookupDerived(s, dwarf.RangePrefix+s.Name)
+			s.Func.dwarfDebugLinesSym = ctxt.LookupDerived(s, dwarf.DebugLinesPrefix+s.Name)
 		}
-		s.Func.dwarfRangesSym = ctxt.LookupDerived(s, dwarf.RangePrefix+s.Name)
 		if s.WasInlined() {
 			s.Func.dwarfAbsFnSym = ctxt.DwFixups.AbsFuncDwarfSym(s)
 		}
-		s.Func.dwarfIsStmtSym = ctxt.LookupDerived(s, dwarf.IsStmtPrefix+s.Name)
-
 	}
-	return s.Func.dwarfInfoSym, s.Func.dwarfLocSym, s.Func.dwarfRangesSym, s.Func.dwarfAbsFnSym, s.Func.dwarfIsStmtSym
+	return s.Func.dwarfInfoSym, s.Func.dwarfLocSym, s.Func.dwarfRangesSym, s.Func.dwarfAbsFnSym, s.Func.dwarfDebugLinesSym
 }
 
-func (s *LSym) Len() int64 {
+func (s *LSym) Length(dwarfContext interface{}) int64 {
 	return s.Size
 }
 
@@ -569,15 +609,14 @@ func (ctxt *Link) fileSymbol(fn *LSym) *LSym {
 // TEXT symbol 's'. The various DWARF symbols must already have been
 // initialized in InitTextSym.
 func (ctxt *Link) populateDWARF(curfn interface{}, s *LSym, myimportpath string) {
-	info, loc, ranges, absfunc, _ := ctxt.dwarfSym(s)
+	info, loc, ranges, absfunc, lines := ctxt.dwarfSym(s)
 	if info.Size != 0 {
 		ctxt.Diag("makeFuncDebugEntry double process %v", s)
 	}
 	var scopes []dwarf.Scope
 	var inlcalls dwarf.InlCalls
 	if ctxt.DebugInfo != nil {
-		stmtData(ctxt, s)
-		scopes, inlcalls = ctxt.DebugInfo(s, curfn)
+		scopes, inlcalls = ctxt.DebugInfo(s, info, curfn)
 	}
 	var err error
 	dwctxt := dwCtxt{ctxt}
@@ -609,6 +648,8 @@ func (ctxt *Link) populateDWARF(curfn interface{}, s *LSym, myimportpath string)
 	if err != nil {
 		ctxt.Diag("emitting DWARF for %s failed: %v", s.Name, err)
 	}
+	// Fill in the debug lines symbol.
+	ctxt.generateDebugLinesSymbol(s, lines)
 }
 
 // DwarfIntConst creates a link symbol for an integer constant with the
@@ -632,7 +673,7 @@ func (ctxt *Link) DwarfAbstractFunc(curfn interface{}, s *LSym, myimportpath str
 	if s.Func == nil {
 		s.Func = new(FuncInfo)
 	}
-	scopes, _ := ctxt.DebugInfo(s, curfn)
+	scopes, _ := ctxt.DebugInfo(s, absfn, curfn)
 	dwctxt := dwCtxt{ctxt}
 	filesym := ctxt.fileSymbol(s)
 	fnstate := dwarf.FnState{
@@ -650,7 +691,7 @@ func (ctxt *Link) DwarfAbstractFunc(curfn interface{}, s *LSym, myimportpath str
 	}
 }
 
-// This table is designed to aid in the creation of references betweeen
+// This table is designed to aid in the creation of references between
 // DWARF subprogram DIEs.
 //
 // In most cases when one DWARF DIE has to refer to another DWARF DIE,
@@ -746,6 +787,14 @@ func (ft *DwarfFixupTable) SetPrecursorFunc(s *LSym, fn interface{}) {
 	absfn.Set(AttrDuplicateOK, true)
 	absfn.Type = objabi.SDWARFINFO
 	ft.ctxt.Data = append(ft.ctxt.Data, absfn)
+
+	// In the case of "late" inlining (inlines that happen during
+	// wrapper generation as opposed to the main inlining phase) it's
+	// possible that we didn't cache the abstract function sym for the
+	// text symbol -- do so now if needed. See issue 38068.
+	if s.Func != nil && s.Func.dwarfAbsFnSym == nil {
+		s.Func.dwarfAbsFnSym = absfn
+	}
 
 	ft.precursor[s] = fnState{precursor: fn, absfn: absfn}
 }
@@ -871,7 +920,7 @@ func (ft *DwarfFixupTable) Finalize(myimportpath string, trace bool) {
 		fns[idx] = fn
 		idx++
 	}
-	sort.Sort(bySymName(fns))
+	sort.Sort(BySymName(fns))
 
 	// Should not be called during parallel portion of compilation.
 	if ft.ctxt.InParallel {
@@ -899,8 +948,8 @@ func (ft *DwarfFixupTable) Finalize(myimportpath string, trace bool) {
 	}
 }
 
-type bySymName []*LSym
+type BySymName []*LSym
 
-func (s bySymName) Len() int           { return len(s) }
-func (s bySymName) Less(i, j int) bool { return s[i].Name < s[j].Name }
-func (s bySymName) Swap(i, j int)      { s[i], s[j] = s[j], s[i] }
+func (s BySymName) Len() int           { return len(s) }
+func (s BySymName) Less(i, j int) bool { return s[i].Name < s[j].Name }
+func (s BySymName) Swap(i, j int)      { s[i], s[j] = s[j], s[i] }

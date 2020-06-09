@@ -37,13 +37,9 @@ func testableNetwork(network string) bool {
 	ss := strings.Split(network, ":")
 	switch ss[0] {
 	case "ip+nopriv":
-		switch runtime.GOOS {
-		case "nacl":
-			return false
-		}
 	case "ip", "ip4", "ip6":
 		switch runtime.GOOS {
-		case "nacl", "plan9":
+		case "plan9":
 			return false
 		default:
 			if os.Getuid() != 0 {
@@ -52,18 +48,18 @@ func testableNetwork(network string) bool {
 		}
 	case "unix", "unixgram":
 		switch runtime.GOOS {
-		case "android", "nacl", "plan9", "windows":
+		case "android", "plan9", "windows":
 			return false
 		case "aix":
 			return unixEnabledOnAIX
 		}
 		// iOS does not support unix, unixgram.
-		if runtime.GOOS == "darwin" && (runtime.GOARCH == "arm" || runtime.GOARCH == "arm64") {
+		if iOS() {
 			return false
 		}
 	case "unixpacket":
 		switch runtime.GOOS {
-		case "aix", "android", "darwin", "nacl", "plan9", "windows":
+		case "aix", "android", "darwin", "plan9", "windows":
 			return false
 		case "netbsd":
 			// It passes on amd64 at least. 386 fails (Issue 22927). arm is unknown.
@@ -83,6 +79,10 @@ func testableNetwork(network string) bool {
 		}
 	}
 	return true
+}
+
+func iOS() bool {
+	return runtime.GOOS == "darwin" && runtime.GOARCH == "arm64"
 }
 
 // testableAddress reports whether address of network is testable on

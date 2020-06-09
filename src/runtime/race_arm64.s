@@ -421,8 +421,7 @@ TEXT	runtime·racecallbackthunk(SB), NOSPLIT|NOFRAME, $0
 	// First, code below assumes that we are on curg, while raceGetProcCmd
 	// can be executed on g0. Second, it is called frequently, so will
 	// benefit from this fast path.
-	CMP	$0, R0
-	BNE	rest
+	CBNZ	R0, rest
 	MOVD	g, R13
 	load_g
 	MOVD	g_m(g), R0
@@ -432,15 +431,15 @@ TEXT	runtime·racecallbackthunk(SB), NOSPLIT|NOFRAME, $0
 	MOVD	R13, g
 	JMP	(LR)
 rest:
-        // Save callee-saved registers (Go code won't respect that).
+	// Save callee-saved registers (Go code won't respect that).
 	// 8(RSP) and 16(RSP) are for args passed through racecallback
-	SUB	$96, RSP
+	SUB	$112, RSP
 	MOVD	LR, 0(RSP)
 	STP	(R19, R20), 24(RSP)
 	STP	(R21, R22), 40(RSP)
 	STP	(R23, R24), 56(RSP)
 	STP	(R25, R26), 72(RSP)
-	MOVD	R27, 88(RSP)
+	STP	(R27,   g), 88(RSP)
 	// Set g = g0.
 	// load_g will clobber R0, Save R0
 	MOVD	R0, R13
@@ -448,7 +447,10 @@ rest:
 	// restore R0
 	MOVD	R13, R0
 	MOVD	g_m(g), R13
-	MOVD	m_g0(R13), g
+	MOVD	m_g0(R13), R14
+	CMP	R14, g
+	BEQ	noswitch	// branch if already on g0
+	MOVD	R14, g
 
 	MOVD	R0, 8(RSP)	// func arg
 	MOVD	R1, 16(RSP)	// func arg
@@ -457,15 +459,23 @@ rest:
 	// All registers are smashed after Go code, reload.
 	MOVD	g_m(g), R13
 	MOVD	m_curg(R13), g	// g = m->curg
+ret:
 	// Restore callee-saved registers.
 	MOVD	0(RSP), LR
 	LDP	24(RSP), (R19, R20)
 	LDP	40(RSP), (R21, R22)
 	LDP	56(RSP), (R23, R24)
 	LDP	72(RSP), (R25, R26)
-	MOVD	88(RSP), R27
-	ADD	$96, RSP
+	LDP	88(RSP), (R27,   g)
+	ADD	$112, RSP
 	JMP	(LR)
+
+noswitch:
+	// already on g0
+	MOVD	R0, 8(RSP)	// func arg
+	MOVD	R1, 16(RSP)	// func arg
+	BL	runtime·racecallback(SB)
+	JMP	ret
 
 // tls_g, g value for each thread in TLS
 GLOBL runtime·tls_g+0(SB), TLSBSS+DUPOK, $8

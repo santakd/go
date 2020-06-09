@@ -757,11 +757,13 @@ var gcdTests = []struct {
 }{
 	// a <= 0 || b <= 0
 	{"0", "0", "0", "0", "0"},
-	{"0", "0", "0", "0", "7"},
-	{"0", "0", "0", "11", "0"},
-	{"0", "0", "0", "-77", "35"},
-	{"0", "0", "0", "64515", "-24310"},
-	{"0", "0", "0", "-64515", "-24310"},
+	{"7", "0", "1", "0", "7"},
+	{"7", "0", "-1", "0", "-7"},
+	{"11", "1", "0", "11", "0"},
+	{"7", "-1", "-2", "-77", "35"},
+	{"935", "-3", "8", "64515", "24310"},
+	{"935", "-3", "-8", "64515", "-24310"},
+	{"935", "3", "-8", "-64515", "-24310"},
 
 	{"1", "-9", "47", "120", "23"},
 	{"7", "1", "-2", "77", "35"},
@@ -1067,6 +1069,20 @@ func TestCmpAbs(t *testing.T) {
 					t.Errorf("absCmp |%s|, |%s|: got %d; want %d", &a, &b, got, want)
 				}
 			}
+		}
+	}
+}
+
+func TestIntCmpSelf(t *testing.T) {
+	for _, s := range cmpAbsTests {
+		x, ok := new(Int).SetString(s, 0)
+		if !ok {
+			t.Fatalf("SetString(%s, 0) failed", s)
+		}
+		got := x.Cmp(x)
+		want := 0
+		if got != want {
+			t.Errorf("x = %s: x.Cmp(x): got %d; want %d", x, got, want)
 		}
 	}
 }
@@ -1813,11 +1829,68 @@ func benchmarkDiv(b *testing.B, aSize, bSize int) {
 }
 
 func BenchmarkDiv(b *testing.B) {
-	min, max, step := 10, 100000, 10
-	for i := min; i <= max; i *= step {
+	sizes := []int{
+		10, 20, 50, 100, 200, 500, 1000,
+		1e4, 1e5, 1e6, 1e7,
+	}
+	for _, i := range sizes {
 		j := 2 * i
 		b.Run(fmt.Sprintf("%d/%d", j, i), func(b *testing.B) {
 			benchmarkDiv(b, j, i)
+		})
+	}
+}
+
+func TestFillBytes(t *testing.T) {
+	checkResult := func(t *testing.T, buf []byte, want *Int) {
+		t.Helper()
+		got := new(Int).SetBytes(buf)
+		if got.CmpAbs(want) != 0 {
+			t.Errorf("got 0x%x, want 0x%x: %x", got, want, buf)
+		}
+	}
+	panics := func(f func()) (panic bool) {
+		defer func() { panic = recover() != nil }()
+		f()
+		return
+	}
+
+	for _, n := range []string{
+		"0",
+		"1000",
+		"0xffffffff",
+		"-0xffffffff",
+		"0xffffffffffffffff",
+		"0x10000000000000000",
+		"0xabababababababababababababababababababababababababa",
+		"0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+	} {
+		t.Run(n, func(t *testing.T) {
+			t.Logf(n)
+			x, ok := new(Int).SetString(n, 0)
+			if !ok {
+				panic("invalid test entry")
+			}
+
+			// Perfectly sized buffer.
+			byteLen := (x.BitLen() + 7) / 8
+			buf := make([]byte, byteLen)
+			checkResult(t, x.FillBytes(buf), x)
+
+			// Way larger, checking all bytes get zeroed.
+			buf = make([]byte, 100)
+			for i := range buf {
+				buf[i] = 0xff
+			}
+			checkResult(t, x.FillBytes(buf), x)
+
+			// Too small.
+			if byteLen > 0 {
+				buf = make([]byte, byteLen-1)
+				if !panics(func() { x.FillBytes(buf) }) {
+					t.Errorf("expected panic for small buffer and value %x", x)
+				}
+			}
 		})
 	}
 }

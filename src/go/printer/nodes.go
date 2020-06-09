@@ -791,11 +791,17 @@ func (p *printer) expr1(expr ast.Expr, prec1, depth int) {
 		}
 
 	case *ast.BasicLit:
+		if p.Config.Mode&StdFormat != 0 {
+			x = normalizeNumbers(x)
+		}
 		p.print(x)
 
 	case *ast.FuncLit:
-		p.expr(x.Type)
-		p.funcBody(p.distanceFrom(x.Type.Pos()), blank, x.Body)
+		p.print(x.Type.Pos(), token.FUNC)
+		// See the comment in funcDecl about how the header size is computed.
+		startCol := p.out.Column - len("func")
+		p.signature(x.Type.Params, x.Type.Results)
+		p.funcBody(p.distanceFrom(x.Type.Pos(), startCol), blank, x.Body)
 
 	case *ast.ParenExpr:
 		if _, hasParens := x.X.(*ast.ParenExpr); hasParens {
@@ -966,6 +972,62 @@ func (p *printer) expr1(expr ast.Expr, prec1, depth int) {
 	default:
 		panic("unreachable")
 	}
+}
+
+// normalizeNumbers rewrites base prefixes and exponents to
+// use lower-case letters, and removes leading 0's from
+// integer imaginary literals. It leaves hexadecimal digits
+// alone.
+func normalizeNumbers(lit *ast.BasicLit) *ast.BasicLit {
+	if lit.Kind != token.INT && lit.Kind != token.FLOAT && lit.Kind != token.IMAG {
+		return lit // not a number - nothing to do
+	}
+	if len(lit.Value) < 2 {
+		return lit // only one digit (common case) - nothing to do
+	}
+	// len(lit.Value) >= 2
+
+	// We ignore lit.Kind because for lit.Kind == token.IMAG the literal may be an integer
+	// or floating-point value, decimal or not. Instead, just consider the literal pattern.
+	x := lit.Value
+	switch x[:2] {
+	default:
+		// 0-prefix octal, decimal int, or float (possibly with 'i' suffix)
+		if i := strings.LastIndexByte(x, 'E'); i >= 0 {
+			x = x[:i] + "e" + x[i+1:]
+			break
+		}
+		// remove leading 0's from integer (but not floating-point) imaginary literals
+		if x[len(x)-1] == 'i' && strings.IndexByte(x, '.') < 0 && strings.IndexByte(x, 'e') < 0 {
+			x = strings.TrimLeft(x, "0_")
+			if x == "i" {
+				x = "0i"
+			}
+		}
+	case "0X":
+		x = "0x" + x[2:]
+		// possibly a hexadecimal float
+		if i := strings.LastIndexByte(x, 'P'); i >= 0 {
+			x = x[:i] + "p" + x[i+1:]
+		}
+	case "0x":
+		// possibly a hexadecimal float
+		i := strings.LastIndexByte(x, 'P')
+		if i == -1 {
+			return lit // nothing to do
+		}
+		x = x[:i] + "p" + x[i+1:]
+	case "0O":
+		x = "0o" + x[2:]
+	case "0o":
+		return lit // nothing to do
+	case "0B":
+		x = "0b" + x[2:]
+	case "0b":
+		return lit // nothing to do
+	}
+
+	return &ast.BasicLit{ValuePos: lit.ValuePos, Kind: lit.Kind, Value: x}
 }
 
 func (p *printer) possibleSelectorExpr(expr ast.Expr, prec1, depth int) bool {
@@ -1237,10 +1299,12 @@ func (p *printer) stmt(stmt ast.Stmt, nextIsRBrace bool) {
 			// lead to more nicely formatted code in general.
 			if p.indentList(s.Results) {
 				p.print(indent)
-				p.exprList(s.Pos(), s.Results, 1, noIndent, token.NoPos, false)
+				// Use NoPos so that a newline never goes before
+				// the results (see issue #32854).
+				p.exprList(token.NoPos, s.Results, 1, noIndent, token.NoPos, false)
 				p.print(unindent)
 			} else {
-				p.exprList(s.Pos(), s.Results, 1, 0, token.NoPos, false)
+				p.exprList(token.NoPos, s.Results, 1, 0, token.NoPos, false)
 			}
 		}
 
@@ -1687,14 +1751,12 @@ func (p *printer) funcBody(headerSize int, sep whiteSpace, b *ast.BlockStmt) {
 	p.block(b, 1)
 }
 
-// distanceFrom returns the column difference between from and p.pos (the current
-// estimated position) if both are on the same line; if they are on different lines
-// (or unknown) the result is infinity.
-func (p *printer) distanceFrom(from token.Pos) int {
-	if from.IsValid() && p.pos.IsValid() {
-		if f := p.posFor(from); f.Line == p.pos.Line {
-			return p.pos.Column - f.Column
-		}
+// distanceFrom returns the column difference between p.out (the current output
+// position) and startOutCol. If the start position is on a different line from
+// the current position (or either is unknown), the result is infinity.
+func (p *printer) distanceFrom(startPos token.Pos, startOutCol int) int {
+	if startPos.IsValid() && p.pos.IsValid() && p.posFor(startPos).Line == p.pos.Line {
+		return p.out.Column - startOutCol
 	}
 	return infinity
 }
@@ -1702,13 +1764,17 @@ func (p *printer) distanceFrom(from token.Pos) int {
 func (p *printer) funcDecl(d *ast.FuncDecl) {
 	p.setComment(d.Doc)
 	p.print(d.Pos(), token.FUNC, blank)
+	// We have to save startCol only after emitting FUNC; otherwise it can be on a
+	// different line (all whitespace preceding the FUNC is emitted only when the
+	// FUNC is emitted).
+	startCol := p.out.Column - len("func ")
 	if d.Recv != nil {
 		p.parameters(d.Recv) // method: print receiver
 		p.print(blank)
 	}
 	p.expr(d.Name)
 	p.signature(d.Type.Params, d.Type.Results)
-	p.funcBody(p.distanceFrom(d.Pos()), vtab, d.Body)
+	p.funcBody(p.distanceFrom(d.Pos(), startCol), vtab, d.Body)
 }
 
 func (p *printer) decl(decl ast.Decl) {

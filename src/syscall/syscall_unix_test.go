@@ -70,7 +70,7 @@ func _() {
 // Thus this test also verifies that the Flock_t structure can be
 // roundtripped with F_SETLK and F_GETLK.
 func TestFcntlFlock(t *testing.T) {
-	if runtime.GOOS == "darwin" && (runtime.GOARCH == "arm" || runtime.GOARCH == "arm64") {
+	if runtime.GOOS == "darwin" && runtime.GOARCH == "arm64" {
 		t.Skip("skipping; no child processes allowed on iOS")
 	}
 	flock := syscall.Flock_t{
@@ -382,5 +382,11 @@ func TestSetsockoptString(t *testing.T) {
 	err := syscall.SetsockoptString(-1, 0, 0, "")
 	if err == nil {
 		t.Fatalf("SetsockoptString: did not fail")
+	}
+}
+
+func TestENFILETemporary(t *testing.T) {
+	if !syscall.ENFILE.Temporary() {
+		t.Error("ENFILE is not treated as a temporary error")
 	}
 }

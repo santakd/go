@@ -41,7 +41,7 @@ func NewWriter(w io.Writer) *Writer {
 	}
 }
 
-// Writer writes a single CSV record to w along with any necessary quoting.
+// Write writes a single CSV record to w along with any necessary quoting.
 // A record is a slice of strings with each string being one field.
 // Writes are buffered, so Flush must eventually be called to ensure
 // that the record is written to the underlying io.Writer.
@@ -158,8 +158,22 @@ func (w *Writer) fieldNeedsQuotes(field string) bool {
 	if field == "" {
 		return false
 	}
-	if field == `\.` || strings.ContainsRune(field, w.Comma) || strings.ContainsAny(field, "\"\r\n") {
+
+	if field == `\.` {
 		return true
+	}
+
+	if w.Comma < utf8.RuneSelf {
+		for i := 0; i < len(field); i++ {
+			c := field[i]
+			if c == '\n' || c == '\r' || c == '"' || c == byte(w.Comma) {
+				return true
+			}
+		}
+	} else {
+		if strings.ContainsRune(field, w.Comma) || strings.ContainsAny(field, "\"\r\n") {
+			return true
+		}
 	}
 
 	r1, _ := utf8.DecodeRuneInString(field)

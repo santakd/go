@@ -28,15 +28,18 @@ func isQuoted(s string) bool {
 	return len(s) >= 2 && s[0] == '"' && s[len(s)-1] == '"'
 }
 
+type PragmaFlag int16
+
 const (
 	// Func pragmas.
-	Nointerface    syntax.Pragma = 1 << iota
-	Noescape                     // func parameters don't escape
-	Norace                       // func must not have race detector annotations
-	Nosplit                      // func should not execute on separate stack
-	Noinline                     // func should not be inlined
-	CgoUnsafeArgs                // treat a pointer to one arg as a pointer to them all
-	UintptrEscapes               // pointers converted to uintptr escape
+	Nointerface    PragmaFlag = 1 << iota
+	Noescape                  // func parameters don't escape
+	Norace                    // func must not have race detector annotations
+	Nosplit                   // func should not execute on separate stack
+	Noinline                  // func should not be inlined
+	NoCheckPtr                // func should not be instrumented by checkptr
+	CgoUnsafeArgs             // treat a pointer to one arg as a pointer to them all
+	UintptrEscapes            // pointers converted to uintptr escape
 
 	// Runtime-only func pragmas.
 	// See ../../../../runtime/README.md for detailed descriptions.
@@ -49,7 +52,24 @@ const (
 	NotInHeap // values of this type must not be heap allocated
 )
 
-func pragmaValue(verb string) syntax.Pragma {
+const (
+	FuncPragmas = Nointerface |
+		Noescape |
+		Norace |
+		Nosplit |
+		Noinline |
+		NoCheckPtr |
+		CgoUnsafeArgs |
+		UintptrEscapes |
+		Systemstack |
+		Nowritebarrier |
+		Nowritebarrierrec |
+		Yeswritebarrierrec
+
+	TypePragmas = NotInHeap
+)
+
+func pragmaFlag(verb string) PragmaFlag {
 	switch verb {
 	case "go:nointerface":
 		if objabi.Fieldtrack_enabled != 0 {
@@ -60,9 +80,11 @@ func pragmaValue(verb string) syntax.Pragma {
 	case "go:norace":
 		return Norace
 	case "go:nosplit":
-		return Nosplit
+		return Nosplit | NoCheckPtr // implies NoCheckPtr (see #34972)
 	case "go:noinline":
 		return Noinline
+	case "go:nocheckptr":
+		return NoCheckPtr
 	case "go:systemstack":
 		return Systemstack
 	case "go:nowritebarrier":
@@ -72,7 +94,7 @@ func pragmaValue(verb string) syntax.Pragma {
 	case "go:yeswritebarrierrec":
 		return Yeswritebarrierrec
 	case "go:cgo_unsafe_args":
-		return CgoUnsafeArgs
+		return CgoUnsafeArgs | NoCheckPtr // implies NoCheckPtr (see #34968)
 	case "go:uintptrescapes":
 		// For the next function declared in the file
 		// any uintptr arguments may be pointer values

@@ -7,9 +7,14 @@ package net
 import (
 	"context"
 	"internal/nettrace"
-	"internal/poll"
 	"syscall"
 	"time"
+)
+
+// defaultTCPKeepAlive is a default constant value for TCPKeepAlive times
+// See golang.org/issue/31510
+const (
+	defaultTCPKeepAlive = 15 * time.Second
 )
 
 // A Dialer contains options for connecting to an address.
@@ -17,6 +22,8 @@ import (
 // The zero value for each field is equivalent to dialing
 // without that option. Dialing with the zero value of Dialer
 // is therefore equivalent to just calling the Dial function.
+//
+// It is safe to call Dialer's methods concurrently.
 type Dialer struct {
 	// Timeout is the maximum amount of time a dial will wait for
 	// a connect to complete. If Deadline is also set, it may fail
@@ -133,7 +140,7 @@ func partialDeadline(now, deadline time.Time, addrsRemaining int) (time.Time, er
 	}
 	timeRemaining := deadline.Sub(now)
 	if timeRemaining <= 0 {
-		return time.Time{}, poll.ErrTimeout
+		return time.Time{}, errTimeout
 	}
 	// Tentatively allocate equal time to each remaining address.
 	timeout := timeRemaining / time.Duration(addrsRemaining)
@@ -425,7 +432,7 @@ func (d *Dialer) DialContext(ctx context.Context, network, address string) (Conn
 		setKeepAlive(tc.fd, true)
 		ka := d.KeepAlive
 		if d.KeepAlive == 0 {
-			ka = 15 * time.Second
+			ka = defaultTCPKeepAlive
 		}
 		setKeepAlivePeriod(tc.fd, ka)
 		testHookSetKeepAlive(ka)
@@ -521,20 +528,21 @@ func (sd *sysDialer) dialSerial(ctx context.Context, ras addrList) (Conn, error)
 		default:
 		}
 
-		deadline, _ := ctx.Deadline()
-		partialDeadline, err := partialDeadline(time.Now(), deadline, len(ras)-i)
-		if err != nil {
-			// Ran out of time.
-			if firstErr == nil {
-				firstErr = &OpError{Op: "dial", Net: sd.network, Source: sd.LocalAddr, Addr: ra, Err: err}
-			}
-			break
-		}
 		dialCtx := ctx
-		if partialDeadline.Before(deadline) {
-			var cancel context.CancelFunc
-			dialCtx, cancel = context.WithDeadline(ctx, partialDeadline)
-			defer cancel()
+		if deadline, hasDeadline := ctx.Deadline(); hasDeadline {
+			partialDeadline, err := partialDeadline(time.Now(), deadline, len(ras)-i)
+			if err != nil {
+				// Ran out of time.
+				if firstErr == nil {
+					firstErr = &OpError{Op: "dial", Net: sd.network, Source: sd.LocalAddr, Addr: ra, Err: err}
+				}
+				break
+			}
+			if partialDeadline.Before(deadline) {
+				var cancel context.CancelFunc
+				dialCtx, cancel = context.WithDeadline(ctx, partialDeadline)
+				defer cancel()
+			}
 		}
 
 		c, err := sd.dialSingle(dialCtx, ra)

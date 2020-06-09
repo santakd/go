@@ -111,11 +111,10 @@ func openFileNolog(name string, flag int, perm FileMode) (*File, error) {
 		fd, e = syscall.Create(name, flag, syscallMode(perm))
 	} else {
 		fd, e = syscall.Open(name, flag)
-		if e != nil && create {
-			var e1 error
-			fd, e1 = syscall.Create(name, flag, syscallMode(perm))
-			if e1 == nil {
-				e = nil
+		if IsNotExist(e) && create {
+			fd, e = syscall.Create(name, flag, syscallMode(perm))
+			if e != nil {
+				return nil, &PathError{"create", name, e}
 			}
 		}
 	}
@@ -136,6 +135,7 @@ func openFileNolog(name string, flag int, perm FileMode) (*File, error) {
 // Close closes the File, rendering it unusable for I/O.
 // On files that support SetDeadline, any pending I/O operations will
 // be canceled and return immediately with an error.
+// Close will return an error if it has already been called.
 func (f *File) Close() error {
 	if err := f.checkValid("close"); err != nil {
 		return err
@@ -289,6 +289,11 @@ func (f *File) pwrite(b []byte, off int64) (n int, err error) {
 // relative to the current offset, and 2 means relative to the end.
 // It returns the new offset and an error, if any.
 func (f *File) seek(offset int64, whence int) (ret int64, err error) {
+	if f.dirinfo != nil {
+		// Free cached dirinfo, so we allocate a new one if we
+		// access this file as a directory again. See #35767 and #37161.
+		f.dirinfo = nil
+	}
 	return syscall.Seek(f.fd, offset, whence)
 }
 

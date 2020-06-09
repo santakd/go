@@ -6,6 +6,8 @@ package runtime_test
 
 import (
 	"fmt"
+	"internal/race"
+	"internal/testenv"
 	"math"
 	"net"
 	"runtime"
@@ -356,6 +358,17 @@ func TestPreemptionGC(t *testing.T) {
 	atomic.StoreUint32(&stop, 1)
 }
 
+func TestAsyncPreempt(t *testing.T) {
+	if !runtime.PreemptMSupported {
+		t.Skip("asynchronous preemption not supported on this platform")
+	}
+	output := runTestProg(t, "testprog", "AsyncPreempt")
+	want := "OK\n"
+	if output != want {
+		t.Fatalf("want %s, got %s\n", want, output)
+	}
+}
+
 func TestGCFairness(t *testing.T) {
 	output := runTestProg(t, "testprog", "GCFairness")
 	want := "OK\n"
@@ -410,6 +423,11 @@ func TestPingPongHog(t *testing.T) {
 	}
 	if testing.Short() {
 		t.Skip("skipping in -short mode")
+	}
+	if race.Enabled {
+		// The race detector randomizes the scheduler,
+		// which causes this test to fail (#38266).
+		t.Skip("skipping in -race mode")
 	}
 
 	defer runtime.GOMAXPROCS(runtime.GOMAXPROCS(1))
@@ -912,6 +930,29 @@ func TestLockOSThreadAvoidsStatePropagation(t *testing.T) {
 	}
 }
 
+func TestLockOSThreadTemplateThreadRace(t *testing.T) {
+	testenv.MustHaveGoRun(t)
+
+	exe, err := buildTestProg(t, "testprog")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	iterations := 100
+	if testing.Short() {
+		// Reduce run time to ~100ms, with much lower probability of
+		// catching issues.
+		iterations = 5
+	}
+	for i := 0; i < iterations; i++ {
+		want := "OK\n"
+		output := runBuiltTestProg(t, exe, "LockOSThreadTemplateThreadRace")
+		if output != want {
+			t.Fatalf("run %d: want %q, got %q", i, want, output)
+		}
+	}
+}
+
 // fakeSyscall emulates a system call.
 //go:nosplit
 func fakeSyscall(duration time.Duration) {
@@ -975,5 +1016,67 @@ func TestPreemptionAfterSyscall(t *testing.T) {
 		t.Run(fmt.Sprint(d), func(t *testing.T) {
 			testPreemptionAfterSyscall(t, d)
 		})
+	}
+}
+
+func TestGetgThreadSwitch(t *testing.T) {
+	runtime.RunGetgThreadSwitchTest()
+}
+
+// TestNetpollBreak tests that netpollBreak can break a netpoll.
+// This test is not particularly safe since the call to netpoll
+// will pick up any stray files that are ready, but it should work
+// OK as long it is not run in parallel.
+func TestNetpollBreak(t *testing.T) {
+	if runtime.GOMAXPROCS(0) == 1 {
+		t.Skip("skipping: GOMAXPROCS=1")
+	}
+
+	// Make sure that netpoll is initialized.
+	runtime.NetpollGenericInit()
+
+	start := time.Now()
+	c := make(chan bool, 2)
+	go func() {
+		c <- true
+		runtime.Netpoll(10 * time.Second.Nanoseconds())
+		c <- true
+	}()
+	<-c
+	// Loop because the break might get eaten by the scheduler.
+	// Break twice to break both the netpoll we started and the
+	// scheduler netpoll.
+loop:
+	for {
+		runtime.Usleep(100)
+		runtime.NetpollBreak()
+		runtime.NetpollBreak()
+		select {
+		case <-c:
+			break loop
+		default:
+		}
+	}
+	if dur := time.Since(start); dur > 5*time.Second {
+		t.Errorf("netpollBreak did not interrupt netpoll: slept for: %v", dur)
+	}
+}
+
+// TestBigGOMAXPROCS tests that setting GOMAXPROCS to a large value
+// doesn't cause a crash at startup. See issue 38474.
+func TestBigGOMAXPROCS(t *testing.T) {
+	t.Parallel()
+	output := runTestProg(t, "testprog", "NonexistentTest", "GOMAXPROCS=1024")
+	// Ignore error conditions on small machines.
+	for _, errstr := range []string{
+		"failed to create new OS thread",
+		"cannot allocate memory",
+	} {
+		if strings.Contains(output, errstr) {
+			t.Skipf("failed to create 1024 threads")
+		}
+	}
+	if !strings.Contains(output, "unknown function: NonexistentTest") {
+		t.Errorf("output:\n%s\nwanted:\nunknown function: NonexistentTest", output)
 	}
 }

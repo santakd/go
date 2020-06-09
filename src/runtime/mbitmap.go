@@ -243,6 +243,10 @@ func (s *mspan) nextFreeIndex() uintptr {
 }
 
 // isFree reports whether the index'th object in s is unallocated.
+//
+// The caller must ensure s.state is mSpanInUse, and there must have
+// been no preemption points since ensuring this (which could allow a
+// GC transition, which would allow the state to change).
 func (s *mspan) isFree(index uintptr) bool {
 	if index < s.freeindex {
 		return false
@@ -349,6 +353,33 @@ func heapBitsForAddr(addr uintptr) (h heapBits) {
 	return
 }
 
+// badPointer throws bad pointer in heap panic.
+func badPointer(s *mspan, p, refBase, refOff uintptr) {
+	// Typically this indicates an incorrect use
+	// of unsafe or cgo to store a bad pointer in
+	// the Go heap. It may also indicate a runtime
+	// bug.
+	//
+	// TODO(austin): We could be more aggressive
+	// and detect pointers to unallocated objects
+	// in allocated spans.
+	printlock()
+	print("runtime: pointer ", hex(p))
+	state := s.state.get()
+	if state != mSpanInUse {
+		print(" to unallocated span")
+	} else {
+		print(" to unused region of span")
+	}
+	print(" span.base()=", hex(s.base()), " span.limit=", hex(s.limit), " span.state=", state, "\n")
+	if refBase != 0 {
+		print("runtime: found in object at *(", hex(refBase), "+", hex(refOff), ")\n")
+		gcDumpObject("object", refBase, refOff)
+	}
+	getg().m.traceback = 2
+	throw("found bad pointer in Go heap (incorrect use of unsafe or cgo?)")
+}
+
 // findObject returns the base address for the heap object containing
 // the address p, the object's span, and the index of the object in s.
 // If p does not point into a heap object, it returns base == 0.
@@ -359,42 +390,30 @@ func heapBitsForAddr(addr uintptr) (h heapBits) {
 // refBase and refOff optionally give the base address of the object
 // in which the pointer p was found and the byte offset at which it
 // was found. These are used for error reporting.
+//
+// It is nosplit so it is safe for p to be a pointer to the current goroutine's stack.
+// Since p is a uintptr, it would not be adjusted if the stack were to move.
+//go:nosplit
 func findObject(p, refBase, refOff uintptr) (base uintptr, s *mspan, objIndex uintptr) {
 	s = spanOf(p)
+	// If s is nil, the virtual address has never been part of the heap.
+	// This pointer may be to some mmap'd region, so we allow it.
+	if s == nil {
+		return
+	}
 	// If p is a bad pointer, it may not be in s's bounds.
-	if s == nil || p < s.base() || p >= s.limit || s.state != mSpanInUse {
-		if s == nil || s.state == mSpanManual {
-			// If s is nil, the virtual address has never been part of the heap.
-			// This pointer may be to some mmap'd region, so we allow it.
-			// Pointers into stacks are also ok, the runtime manages these explicitly.
+	//
+	// Check s.state to synchronize with span initialization
+	// before checking other fields. See also spanOfHeap.
+	if state := s.state.get(); state != mSpanInUse || p < s.base() || p >= s.limit {
+		// Pointers into stacks are also ok, the runtime manages these explicitly.
+		if state == mSpanManual {
 			return
 		}
-
 		// The following ensures that we are rigorous about what data
 		// structures hold valid pointers.
 		if debug.invalidptr != 0 {
-			// Typically this indicates an incorrect use
-			// of unsafe or cgo to store a bad pointer in
-			// the Go heap. It may also indicate a runtime
-			// bug.
-			//
-			// TODO(austin): We could be more aggressive
-			// and detect pointers to unallocated objects
-			// in allocated spans.
-			printlock()
-			print("runtime: pointer ", hex(p))
-			if s.state != mSpanInUse {
-				print(" to unallocated span")
-			} else {
-				print(" to unused region of span")
-			}
-			print(" span.base()=", hex(s.base()), " span.limit=", hex(s.limit), " span.state=", s.state, "\n")
-			if refBase != 0 {
-				print("runtime: found in object at *(", hex(refBase), "+", hex(refOff), ")\n")
-				gcDumpObject("object", refBase, refOff)
-			}
-			getg().m.traceback = 2
-			throw("found bad pointer in Go heap (incorrect use of unsafe or cgo?)")
+			badPointer(s, p, refBase, refOff)
 		}
 		return
 	}
@@ -609,7 +628,7 @@ func bulkBarrierPreWrite(dst, src, size uintptr) {
 			}
 		}
 		return
-	} else if s.state != mSpanInUse || dst < s.base() || s.limit <= dst {
+	} else if s.state.get() != mSpanInUse || dst < s.base() || s.limit <= dst {
 		// dst was heap memory at some point, but isn't now.
 		// It can't be a global. It must be either our stack,
 		// or in the case of direct channel sends, it could be
@@ -781,29 +800,19 @@ func typeBitsBulkBarrier(typ *_type, dst, src, size uintptr) {
 // words to pointer/scan.
 // Otherwise, it initializes all words to scalar/dead.
 func (h heapBits) initSpan(s *mspan) {
-	size, n, total := s.layout()
-
-	// Init the markbit structures
-	s.freeindex = 0
-	s.allocCache = ^uint64(0) // all 1s indicating all free.
-	s.nelems = n
-	s.allocBits = nil
-	s.gcmarkBits = nil
-	s.gcmarkBits = newMarkBits(s.nelems)
-	s.allocBits = newAllocBits(s.nelems)
-
 	// Clear bits corresponding to objects.
-	nw := total / sys.PtrSize
+	nw := (s.npages << _PageShift) / sys.PtrSize
 	if nw%wordsPerBitmapByte != 0 {
 		throw("initSpan: unaligned length")
 	}
 	if h.shift != 0 {
 		throw("initSpan: unaligned base")
 	}
+	isPtrs := sys.PtrSize == 8 && s.elemsize == sys.PtrSize
 	for nw > 0 {
 		hNext, anw := h.forwardOrBoundary(nw)
 		nbyte := anw / wordsPerBitmapByte
-		if sys.PtrSize == 8 && size == sys.PtrSize {
+		if isPtrs {
 			bitp := h.bitp
 			for i := uintptr(0); i < nbyte; i++ {
 				*bitp = bitPointerAll | bitScanAll
@@ -856,58 +865,22 @@ func (h heapBits) clearCheckmarkSpan(size, n, total uintptr) {
 	}
 }
 
-// oneBitCount is indexed by byte and produces the
-// number of 1 bits in that byte. For example 128 has 1 bit set
-// and oneBitCount[128] will holds 1.
-var oneBitCount = [256]uint8{
-	0, 1, 1, 2, 1, 2, 2, 3,
-	1, 2, 2, 3, 2, 3, 3, 4,
-	1, 2, 2, 3, 2, 3, 3, 4,
-	2, 3, 3, 4, 3, 4, 4, 5,
-	1, 2, 2, 3, 2, 3, 3, 4,
-	2, 3, 3, 4, 3, 4, 4, 5,
-	2, 3, 3, 4, 3, 4, 4, 5,
-	3, 4, 4, 5, 4, 5, 5, 6,
-	1, 2, 2, 3, 2, 3, 3, 4,
-	2, 3, 3, 4, 3, 4, 4, 5,
-	2, 3, 3, 4, 3, 4, 4, 5,
-	3, 4, 4, 5, 4, 5, 5, 6,
-	2, 3, 3, 4, 3, 4, 4, 5,
-	3, 4, 4, 5, 4, 5, 5, 6,
-	3, 4, 4, 5, 4, 5, 5, 6,
-	4, 5, 5, 6, 5, 6, 6, 7,
-	1, 2, 2, 3, 2, 3, 3, 4,
-	2, 3, 3, 4, 3, 4, 4, 5,
-	2, 3, 3, 4, 3, 4, 4, 5,
-	3, 4, 4, 5, 4, 5, 5, 6,
-	2, 3, 3, 4, 3, 4, 4, 5,
-	3, 4, 4, 5, 4, 5, 5, 6,
-	3, 4, 4, 5, 4, 5, 5, 6,
-	4, 5, 5, 6, 5, 6, 6, 7,
-	2, 3, 3, 4, 3, 4, 4, 5,
-	3, 4, 4, 5, 4, 5, 5, 6,
-	3, 4, 4, 5, 4, 5, 5, 6,
-	4, 5, 5, 6, 5, 6, 6, 7,
-	3, 4, 4, 5, 4, 5, 5, 6,
-	4, 5, 5, 6, 5, 6, 6, 7,
-	4, 5, 5, 6, 5, 6, 6, 7,
-	5, 6, 6, 7, 6, 7, 7, 8}
-
 // countAlloc returns the number of objects allocated in span s by
 // scanning the allocation bitmap.
-// TODO:(rlh) Use popcount intrinsic.
 func (s *mspan) countAlloc() int {
 	count := 0
-	maxIndex := s.nelems / 8
-	for i := uintptr(0); i < maxIndex; i++ {
-		mrkBits := *s.gcmarkBits.bytep(i)
-		count += int(oneBitCount[mrkBits])
-	}
-	if bitsInLastByte := s.nelems % 8; bitsInLastByte != 0 {
-		mrkBits := *s.gcmarkBits.bytep(maxIndex)
-		mask := uint8((1 << bitsInLastByte) - 1)
-		bits := mrkBits & mask
-		count += int(oneBitCount[bits])
+	bytes := divRoundUp(s.nelems, 8)
+	// Iterate over each 8-byte chunk and count allocations
+	// with an intrinsic. Note that newMarkBits guarantees that
+	// gcmarkBits will be 8-byte aligned, so we don't have to
+	// worry about edge cases, irrelevant bits will simply be zero.
+	for i := uintptr(0); i < bytes; i += 8 {
+		// Extract 64 bits from the byte pointer and get a OnesCount.
+		// Note that the unsafe cast here doesn't preserve endianness,
+		// but that's OK. We only care about how many bits are 1, not
+		// about the order we discover them in.
+		mrkBits := *(*uint64)(unsafe.Pointer(s.gcmarkBits.bytep(i)))
+		count += sys.OnesCount64(mrkBits)
 	}
 	return count
 }
@@ -1667,15 +1640,12 @@ Run:
 			if n == 0 {
 				// Program is over; continue in trailer if present.
 				if trailer != nil {
-					//println("trailer")
 					p = trailer
 					trailer = nil
 					continue
 				}
-				//println("done")
 				break Run
 			}
-			//println("lit", n, dst)
 			nbyte := n / 8
 			for i := uintptr(0); i < nbyte; i++ {
 				bits |= uintptr(*p) << nbits
@@ -1915,7 +1885,11 @@ Run:
 // The bitmask starts at s.startAddr.
 // The result must be deallocated with dematerializeGCProg.
 func materializeGCProg(ptrdata uintptr, prog *byte) *mspan {
-	s := mheap_.allocManual((ptrdata/(8*sys.PtrSize)+pageSize-1)/pageSize, &memstats.gc_sys)
+	// Each word of ptrdata needs one bit in the bitmap.
+	bitmapBytes := divRoundUp(ptrdata, 8*sys.PtrSize)
+	// Compute the number of pages needed for bitmapBytes.
+	pages := divRoundUp(bitmapBytes, pageSize)
+	s := mheap_.allocManual(pages, &memstats.gc_sys)
 	runGCProg(addb(prog, 4), nil, (*byte)(unsafe.Pointer(s.startAddr)), 1)
 	return s
 }

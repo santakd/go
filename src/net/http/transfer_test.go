@@ -278,3 +278,87 @@ func TestTransferWriterWriteBodyReaderTypes(t *testing.T) {
 		})
 	}
 }
+
+func TestParseTransferEncoding(t *testing.T) {
+	tests := []struct {
+		hdr     Header
+		wantErr error
+	}{
+		{
+			hdr:     Header{"Transfer-Encoding": {"fugazi"}},
+			wantErr: &unsupportedTEError{`unsupported transfer encoding: "fugazi"`},
+		},
+		{
+			hdr:     Header{"Transfer-Encoding": {"chunked, chunked", "identity", "chunked"}},
+			wantErr: &unsupportedTEError{`too many transfer encodings: ["chunked, chunked" "identity" "chunked"]`},
+		},
+		{
+			hdr:     Header{"Transfer-Encoding": {""}},
+			wantErr: &unsupportedTEError{`unsupported transfer encoding: ""`},
+		},
+		{
+			hdr:     Header{"Transfer-Encoding": {"chunked, identity"}},
+			wantErr: &unsupportedTEError{`unsupported transfer encoding: "chunked, identity"`},
+		},
+		{
+			hdr:     Header{"Transfer-Encoding": {"chunked", "identity"}},
+			wantErr: &unsupportedTEError{`too many transfer encodings: ["chunked" "identity"]`},
+		},
+		{
+			hdr:     Header{"Transfer-Encoding": {"\x0bchunked"}},
+			wantErr: &unsupportedTEError{`unsupported transfer encoding: "\vchunked"`},
+		},
+		{
+			hdr:     Header{"Transfer-Encoding": {"chunked"}},
+			wantErr: nil,
+		},
+	}
+
+	for i, tt := range tests {
+		tr := &transferReader{
+			Header:     tt.hdr,
+			ProtoMajor: 1,
+			ProtoMinor: 1,
+		}
+		gotErr := tr.parseTransferEncoding()
+		if !reflect.DeepEqual(gotErr, tt.wantErr) {
+			t.Errorf("%d.\ngot error:\n%v\nwant error:\n%v\n\n", i, gotErr, tt.wantErr)
+		}
+	}
+}
+
+// issue 39017 - disallow Content-Length values such as "+3"
+func TestParseContentLength(t *testing.T) {
+	tests := []struct {
+		cl      string
+		wantErr error
+	}{
+		{
+			cl:      "3",
+			wantErr: nil,
+		},
+		{
+			cl:      "+3",
+			wantErr: badStringError("bad Content-Length", "+3"),
+		},
+		{
+			cl:      "-3",
+			wantErr: badStringError("bad Content-Length", "-3"),
+		},
+		{
+			// max int64, for safe conversion before returning
+			cl:      "9223372036854775807",
+			wantErr: nil,
+		},
+		{
+			cl:      "9223372036854775808",
+			wantErr: badStringError("bad Content-Length", "9223372036854775808"),
+		},
+	}
+
+	for _, tt := range tests {
+		if _, gotErr := parseContentLength(tt.cl); !reflect.DeepEqual(gotErr, tt.wantErr) {
+			t.Errorf("%q:\n\tgot=%v\n\twant=%v", tt.cl, gotErr, tt.wantErr)
+		}
+	}
+}

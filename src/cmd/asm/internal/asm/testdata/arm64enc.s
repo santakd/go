@@ -152,6 +152,7 @@ TEXT asmtest(SB),DUPOK|NOSPLIT,$-8
    EXTR $35, R22, R12, R8                     // 888dd693
    SEVL                                       // bf2003d5
    HINT $6                                    // df2003d5
+   HINT $0                                    // 1f2003d5
    HLT $65509                                 // a0fc5fd4
    HVC $61428                                 // 82fe1dd4
    ISB $1                                     // df3103d5
@@ -281,7 +282,7 @@ TEXT asmtest(SB),DUPOK|NOSPLIT,$-8
    NGC R2, R7                                 // e70302da
    NGCSW R10, R5                              // e5030a7a
    NGCS R24, R16                              // f00318fa
-   //TODO NOP                                 // 1f2003d5
+   NOOP                                        // 1f2003d5
    ORNW R4@>11, R16, R3                       // 032ee42a
    ORN R22@>19, R3, R3                        // 634cf6aa
    ORRW $4294443071, R15, R24                 // f8490d32
@@ -711,6 +712,8 @@ TEXT asmtest(SB),DUPOK|NOSPLIT,$-8
    VPMULL2 V2.B16, V1.B16, V4.H8                               // 24e0224e
    VRBIT V10.B16, V21.B16                                      // 5559606e
    VREV32 V2.H8, V1.H8                                         // 4108606e
+   VREV16 V2.B8, V1.B8                                         // 4118200e
+   VREV16 V5.B16, V16.B16                                      // b018204e
    SCVTFWS R6, F17                                             // d100221e
    SCVTFWD R3, F15                                             // 6f00621e
    SCVTFS R20, F25                                             // 9902229e

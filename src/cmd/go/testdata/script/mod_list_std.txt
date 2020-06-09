@@ -2,6 +2,7 @@ env GO111MODULE=on
 env GOPROXY=off
 
 [!gc] skip
+[short] skip
 
 # Outside of GOROOT, our vendored packages should be reported as part of the standard library.
 go list -f '{{if .Standard}}{{.ImportPath}}{{end}}' std cmd
@@ -12,6 +13,16 @@ stdout ^cmd/vendor/golang\.org/x/arch/x86/x86asm
 go list cmd/...
 stdout ^cmd/compile
 ! stdout ^cmd/vendor/golang\.org/x/arch/x86/x86asm
+
+# GOROOT/src/... should list the packages in std as if it were a module
+# dependency: omitting vendored dependencies and stopping at the 'cmd' module
+# boundary.
+
+go list $GOROOT/src/...
+stdout ^bytes$
+! stdout ^builtin$
+! stdout ^cmd/
+! stdout ^vendor/
 
 
 # Within the std module, listing ./... should omit the 'std' prefix:

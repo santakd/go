@@ -15,9 +15,11 @@ package runtime
 import "unsafe"
 
 func newobject(typ *byte) *any
+func mallocgc(size uintptr, typ *byte, needszero bool) unsafe.Pointer
 func panicdivide()
 func panicshift()
 func panicmakeslicelen()
+func panicmakeslicecap()
 func throwinit()
 func panicwrap()
 
@@ -68,13 +70,13 @@ func concatstrings(*[32]byte, []string) string
 
 func cmpstring(string, string) int
 func intstring(*[4]byte, int64) string
-func slicebytetostring(*[32]byte, []byte) string
-func slicebytetostringtmp([]byte) string
+func slicebytetostring(buf *[32]byte, ptr *byte, n int) string
+func slicebytetostringtmp(ptr *byte, n int) string
 func slicerunetostring(*[32]byte, []rune) string
 func stringtoslicebyte(*[32]byte, string) []byte
 func stringtoslicerune(*[32]rune, string) []rune
-func slicecopy(to any, fr any, wid uintptr) int
-func slicestringcopy(to any, fr any) int
+func slicecopy(toPtr *any, toLen int, frPtr *any, frLen int, wid uintptr) int
+func slicestringcopy(toPtr *byte, toLen int, fr string) int
 
 func decoderune(string, int) (retv rune, retk int)
 func countrunes(string) int
@@ -161,7 +163,7 @@ var writeBarrier struct {
 // *byte is really *runtime.Type
 func typedmemmove(typ *byte, dst *any, src *any)
 func typedmemclr(typ *byte, dst *any)
-func typedslicecopy(typ *byte, dst any, src any) int
+func typedslicecopy(typ *byte, dstPtr *any, dstLen int, srcPtr *any, srcLen int) int
 
 func selectnbsend(hchan chan<- any, elem *any) bool
 func selectnbrecv(elem *any, hchan <-chan any) bool
@@ -173,17 +175,41 @@ func block()
 
 func makeslice(typ *byte, len int, cap int) unsafe.Pointer
 func makeslice64(typ *byte, len int64, cap int64) unsafe.Pointer
+func makeslicecopy(typ *byte, tolen int, fromlen int, from unsafe.Pointer) unsafe.Pointer
 func growslice(typ *byte, old []any, cap int) (ary []any)
 func memmove(to *any, frm *any, length uintptr)
 func memclrNoHeapPointers(ptr unsafe.Pointer, n uintptr)
 func memclrHasPointers(ptr unsafe.Pointer, n uintptr)
 
 func memequal(x, y *any, size uintptr) bool
+func memequal0(x, y *any) bool
 func memequal8(x, y *any) bool
 func memequal16(x, y *any) bool
 func memequal32(x, y *any) bool
 func memequal64(x, y *any) bool
 func memequal128(x, y *any) bool
+func f32equal(p, q unsafe.Pointer) bool
+func f64equal(p, q unsafe.Pointer) bool
+func c64equal(p, q unsafe.Pointer) bool
+func c128equal(p, q unsafe.Pointer) bool
+func strequal(p, q unsafe.Pointer) bool
+func interequal(p, q unsafe.Pointer) bool
+func nilinterequal(p, q unsafe.Pointer) bool
+
+func memhash(p unsafe.Pointer, h uintptr, size uintptr) uintptr
+func memhash0(p unsafe.Pointer, h uintptr) uintptr
+func memhash8(p unsafe.Pointer, h uintptr) uintptr
+func memhash16(p unsafe.Pointer, h uintptr) uintptr
+func memhash32(p unsafe.Pointer, h uintptr) uintptr
+func memhash64(p unsafe.Pointer, h uintptr) uintptr
+func memhash128(p unsafe.Pointer, h uintptr) uintptr
+func f32hash(p unsafe.Pointer, h uintptr) uintptr
+func f64hash(p unsafe.Pointer, h uintptr) uintptr
+func c64hash(p unsafe.Pointer, h uintptr) uintptr
+func c128hash(p unsafe.Pointer, h uintptr) uintptr
+func strhash(a unsafe.Pointer, h uintptr) uintptr
+func interhash(p unsafe.Pointer, h uintptr) uintptr
+func nilinterhash(p unsafe.Pointer, h uintptr) uintptr
 
 // only used on 32-bit
 func int64div(int64, int64) int64
@@ -212,7 +238,21 @@ func racewriterange(addr, size uintptr)
 func msanread(addr, size uintptr)
 func msanwrite(addr, size uintptr)
 
+func checkptrAlignment(unsafe.Pointer, *byte, uintptr)
+func checkptrArithmetic(unsafe.Pointer, []unsafe.Pointer)
+
+func libfuzzerTraceCmp1(uint8, uint8)
+func libfuzzerTraceCmp2(uint16, uint16)
+func libfuzzerTraceCmp4(uint32, uint32)
+func libfuzzerTraceCmp8(uint64, uint64)
+func libfuzzerTraceConstCmp1(uint8, uint8)
+func libfuzzerTraceConstCmp2(uint16, uint16)
+func libfuzzerTraceConstCmp4(uint32, uint32)
+func libfuzzerTraceConstCmp8(uint64, uint64)
+
 // architecture variants
 var x86HasPOPCNT bool
 var x86HasSSE41 bool
+var x86HasFMA bool
+var armHasVFPv4 bool
 var arm64HasATOMICS bool

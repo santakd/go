@@ -14,7 +14,7 @@ const debugSelect = false
 
 // scase.kind values.
 // Known to compiler.
-// Changes here must also be made in src/cmd/compile/internal/gc/select.go's walkselect.
+// Changes here must also be made in src/cmd/compile/internal/gc/select.go's walkselectcases.
 const (
 	caseNil = iota
 	caseRecv
@@ -75,6 +75,9 @@ func selunlock(scases []scase, lockorder []uint16) {
 }
 
 func selparkcommit(gp *g, _ unsafe.Pointer) bool {
+	// There are unlocked sudogs that point into gp's stack. Stack
+	// copying must lock the channels of those sudogs.
+	gp.activeStackChans = true
 	// This must not access gp's stack (see gopark). In
 	// particular, it must not access the *hselect. That's okay,
 	// because by the time this is called, gp.waiting has all
@@ -105,8 +108,9 @@ func block() {
 // selectgo implements the select statement.
 //
 // cas0 points to an array of type [ncases]scase, and order0 points to
-// an array of type [2*ncases]uint16. Both reside on the goroutine's
-// stack (regardless of any escaping in selectgo).
+// an array of type [2*ncases]uint16 where ncases must be <= 65536.
+// Both reside on the goroutine's stack (regardless of any escaping in
+// selectgo).
 //
 // selectgo returns the index of the chosen scase, which matches the
 // ordinal position of its respective select{recv,send,default} call.
@@ -117,6 +121,8 @@ func selectgo(cas0 *scase, order0 *uint16, ncases int) (int, bool) {
 		print("select: cas0=", cas0, "\n")
 	}
 
+	// NOTE: In order to maintain a lean stack size, the number of scases
+	// is capped at 65536.
 	cas1 := (*[1 << 16]scase)(unsafe.Pointer(cas0))
 	order1 := (*[1 << 17]uint16)(unsafe.Pointer(order0))
 
@@ -311,6 +317,7 @@ loop:
 	// wait for someone to wake us up
 	gp.param = nil
 	gopark(selparkcommit, nil, waitReasonSelect, traceEvGoBlockSelect, 1)
+	gp.activeStackChans = false
 
 	sellock(scases, lockorder)
 
@@ -493,8 +500,6 @@ sclose:
 }
 
 func (c *hchan) sortkey() uintptr {
-	// TODO(khr): if we have a moving garbage collector, we'll need to
-	// change this function.
 	return uintptr(unsafe.Pointer(c))
 }
 

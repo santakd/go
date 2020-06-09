@@ -8,7 +8,6 @@
 Input to cgo.
 
 GOARCH=amd64 go tool cgo -cdefs defs_darwin.go >defs_darwin_amd64.h
-GOARCH=386 go tool cgo -cdefs defs_darwin.go >defs_darwin_386.h
 */
 
 package runtime
@@ -30,6 +29,7 @@ import "C"
 const (
 	EINTR     = C.EINTR
 	EFAULT    = C.EFAULT
+	EAGAIN    = C.EAGAIN
 	ETIMEDOUT = C.ETIMEDOUT
 
 	PROT_NONE  = C.PROT_NONE
@@ -116,7 +116,11 @@ const (
 	PTHREAD_CREATE_DETACHED = C.PTHREAD_CREATE_DETACHED
 
 	F_SETFD    = C.F_SETFD
+	F_GETFL    = C.F_GETFL
+	F_SETFL    = C.F_SETFL
 	FD_CLOEXEC = C.FD_CLOEXEC
+
+	O_NONBLOCK = C.O_NONBLOCK
 )
 
 type StackT C.struct_sigaltstack

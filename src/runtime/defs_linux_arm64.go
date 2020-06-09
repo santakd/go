@@ -7,6 +7,7 @@ const (
 	_EINTR  = 0x4
 	_EAGAIN = 0xb
 	_ENOMEM = 0xc
+	_ENOSYS = 0x26
 
 	_PROT_NONE  = 0x0
 	_PROT_READ  = 0x1
@@ -90,7 +91,6 @@ const (
 	_EPOLL_CTL_MOD = 0x3
 
 	_AF_UNIX    = 0x1
-	_F_SETFL    = 0x4
 	_SOCK_DGRAM = 0x2
 )
 
@@ -144,8 +144,9 @@ type epollevent struct {
 // ../cmd/cgo/cgo -cdefs defs_linux.go defs1_linux.go defs2_linux.go
 
 const (
-	_O_RDONLY  = 0x0
-	_O_CLOEXEC = 0x80000
+	_O_RDONLY   = 0x0
+	_O_NONBLOCK = 0x800
+	_O_CLOEXEC  = 0x80000
 )
 
 type usigset struct {

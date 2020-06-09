@@ -5,6 +5,7 @@
 package ssa
 
 import (
+	"cmd/compile/internal/types"
 	"container/heap"
 	"sort"
 )
@@ -59,6 +60,18 @@ func (h ValHeap) Less(i, j int) bool {
 			return c < 0 // smaller args comes later
 		}
 	}
+	if c := x.Uses - y.Uses; c != 0 {
+		return c < 0 // smaller uses come later
+	}
+	// These comparisons are fairly arbitrary.
+	// The goal here is stability in the face
+	// of unrelated changes elsewhere in the compiler.
+	if c := x.AuxInt - y.AuxInt; c != 0 {
+		return c > 0
+	}
+	if cmp := x.Type.Compare(y.Type); cmp != types.CMPeq {
+		return cmp == types.CMPgt
+	}
 	return x.ID > y.ID
 }
 
@@ -66,7 +79,7 @@ func (op Op) isLoweredGetClosurePtr() bool {
 	switch op {
 	case OpAMD64LoweredGetClosurePtr, OpPPC64LoweredGetClosurePtr, OpARMLoweredGetClosurePtr, OpARM64LoweredGetClosurePtr,
 		Op386LoweredGetClosurePtr, OpMIPS64LoweredGetClosurePtr, OpS390XLoweredGetClosurePtr, OpMIPSLoweredGetClosurePtr,
-		OpWasmLoweredGetClosurePtr:
+		OpRISCV64LoweredGetClosurePtr, OpWasmLoweredGetClosurePtr:
 		return true
 	}
 	return false
@@ -115,7 +128,7 @@ func schedule(f *Func) {
 				v.Op == OpARMLoweredNilCheck || v.Op == OpARM64LoweredNilCheck ||
 				v.Op == Op386LoweredNilCheck || v.Op == OpMIPS64LoweredNilCheck ||
 				v.Op == OpS390XLoweredNilCheck || v.Op == OpMIPSLoweredNilCheck ||
-				v.Op == OpWasmLoweredNilCheck:
+				v.Op == OpRISCV64LoweredNilCheck || v.Op == OpWasmLoweredNilCheck:
 				// Nil checks must come before loads from the same address.
 				score[v.ID] = ScoreNilCheck
 			case v.Op == OpPhi:
@@ -195,27 +208,31 @@ func schedule(f *Func) {
 			}
 		}
 
-		if b.Control != nil && b.Control.Op != OpPhi && b.Control.Op != OpArg {
-			// Force the control value to be scheduled at the end,
-			// unless it is a phi value (which must be first).
+		for _, c := range b.ControlValues() {
+			// Force the control values to be scheduled at the end,
+			// unless they are phi values (which must be first).
 			// OpArg also goes first -- if it is stack it register allocates
 			// to a LoadReg, if it is register it is from the beginning anyway.
-			score[b.Control.ID] = ScoreControl
+			if c.Op == OpPhi || c.Op == OpArg {
+				continue
+			}
+			score[c.ID] = ScoreControl
 
-			// Schedule values dependent on the control value at the end.
+			// Schedule values dependent on the control values at the end.
 			// This reduces the number of register spills. We don't find
-			// all values that depend on the control, just values with a
+			// all values that depend on the controls, just values with a
 			// direct dependency. This is cheaper and in testing there
 			// was no difference in the number of spills.
 			for _, v := range b.Values {
 				if v.Op != OpPhi {
 					for _, a := range v.Args {
-						if a == b.Control {
+						if a == c {
 							score[v.ID] = ScoreControl
 						}
 					}
 				}
 			}
+
 		}
 
 		// To put things into a priority queue

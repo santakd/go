@@ -34,6 +34,10 @@
 //	}
 //	fmt.Printf("read %d bytes: %q\n", count, data[:count])
 //
+// Note: The maximum number of concurrent operations on a File may be limited by
+// the OS or the system. The number should be high, but exceeding it may degrade
+// performance or cause other issues.
+//
 package os
 
 import (
@@ -139,6 +143,26 @@ func (f *File) ReadAt(b []byte, off int64) (n int, err error) {
 	return
 }
 
+// ReadFrom implements io.ReaderFrom.
+func (f *File) ReadFrom(r io.Reader) (n int64, err error) {
+	if err := f.checkValid("write"); err != nil {
+		return 0, err
+	}
+	n, handled, e := f.readFrom(r)
+	if !handled {
+		return genericReadFrom(f, r) // without wrapping
+	}
+	return n, f.wrapErr("write", e)
+}
+
+func genericReadFrom(f *File, r io.Reader) (int64, error) {
+	return io.Copy(onlyWriter{f}, r)
+}
+
+type onlyWriter struct {
+	io.Writer
+}
+
 // Write writes len(b) bytes to the File.
 // It returns the number of bytes written and an error, if any.
 // Write returns a non-nil error when n != len(b).
@@ -200,6 +224,10 @@ func (f *File) WriteAt(b []byte, off int64) (n int, err error) {
 // relative to the current offset, and 2 means relative to the end.
 // It returns the new offset and an error, if any.
 // The behavior of Seek on a file opened with O_APPEND is not specified.
+//
+// If f is a directory, the behavior of Seek varies by operating
+// system; you can seek to the beginning of the directory on Unix-like
+// operating systems, but not on Windows.
 func (f *File) Seek(offset int64, whence int) (ret int64, err error) {
 	if err := f.checkValid("seek"); err != nil {
 		return 0, err
@@ -224,6 +252,9 @@ func (f *File) WriteString(s string) (n int, err error) {
 // bits (before umask).
 // If there is an error, it will be of type *PathError.
 func Mkdir(name string, perm FileMode) error {
+	if runtime.GOOS == "windows" && isWindowsNulName(name) {
+		return &PathError{"mkdir", name, syscall.ENOTDIR}
+	}
 	e := syscall.Mkdir(fixLongPath(name), syscallMode(perm))
 
 	if e != nil {
@@ -243,7 +274,7 @@ func Mkdir(name string, perm FileMode) error {
 	return nil
 }
 
-// setStickyBit adds ModeSticky to the permision bits of path, non atomic.
+// setStickyBit adds ModeSticky to the permission bits of path, non atomic.
 func setStickyBit(name string) error {
 	fi, err := Stat(name)
 	if err != nil {
@@ -353,7 +384,7 @@ func TempDir() string {
 // within this one and use that.
 //
 // On Unix systems, it returns $XDG_CACHE_HOME as specified by
-// https://standards.freedesktop.org/basedir-spec/basedir-spec-latest.html if
+// https://specifications.freedesktop.org/basedir-spec/basedir-spec-latest.html if
 // non-empty, else $HOME/.cache.
 // On Darwin, it returns $HOME/Library/Caches.
 // On Windows, it returns %LocalAppData%.
@@ -404,9 +435,9 @@ func UserCacheDir() (string, error) {
 // subdirectory within this one and use that.
 //
 // On Unix systems, it returns $XDG_CONFIG_HOME as specified by
-// https://standards.freedesktop.org/basedir-spec/basedir-spec-latest.html if
+// https://specifications.freedesktop.org/basedir-spec/basedir-spec-latest.html if
 // non-empty, else $HOME/.config.
-// On Darwin, it returns $HOME/Library/Preferences.
+// On Darwin, it returns $HOME/Library/Application Support.
 // On Windows, it returns %AppData%.
 // On Plan 9, it returns $home/lib.
 //
@@ -427,7 +458,7 @@ func UserConfigDir() (string, error) {
 		if dir == "" {
 			return "", errors.New("$HOME is not defined")
 		}
-		dir += "/Library/Preferences"
+		dir += "/Library/Application Support"
 
 	case "plan9":
 		dir = Getenv("home")
@@ -468,12 +499,10 @@ func UserHomeDir() (string, error) {
 	}
 	// On some geese the home directory is not always defined.
 	switch runtime.GOOS {
-	case "nacl":
-		return "/", nil
 	case "android":
 		return "/sdcard", nil
 	case "darwin":
-		if runtime.GOARCH == "arm" || runtime.GOARCH == "arm64" {
+		if runtime.GOARCH == "arm64" {
 			return "/", nil
 		}
 	}
@@ -492,7 +521,7 @@ func UserHomeDir() (string, error) {
 //
 // On Windows, only the 0200 bit (owner writable) of mode is used; it
 // controls whether the file's read-only attribute is set or cleared.
-// The other bits are currently unused. For compatibilty with Go 1.12
+// The other bits are currently unused. For compatibility with Go 1.12
 // and earlier, use a non-zero mode. Use mode 0400 for a read-only
 // file and 0600 for a readable+writable file.
 //
@@ -517,10 +546,12 @@ func (f *File) Chmod(mode FileMode) error { return f.chmod(mode) }
 // After a deadline has been exceeded, the connection can be refreshed
 // by setting a deadline in the future.
 //
-// An error returned after a timeout fails will implement the
-// Timeout method, and calling the Timeout method will return true.
-// The PathError and SyscallError types implement the Timeout method.
-// In general, call IsTimeout to test whether an error indicates a timeout.
+// If the deadline is exceeded a call to Read or Write or to other I/O
+// methods will return an error that wraps ErrDeadlineExceeded.
+// This can be tested using errors.Is(err, os.ErrDeadlineExceeded).
+// That error implements the Timeout method, and calling the Timeout
+// method will return true, but there are other possible errors for which
+// the Timeout will return true even if the deadline has not been exceeded.
 //
 // An idle timeout can be implemented by repeatedly extending
 // the deadline after successful Read or Write calls.
@@ -555,4 +586,22 @@ func (f *File) SyscallConn() (syscall.RawConn, error) {
 		return nil, err
 	}
 	return newRawConn(f)
+}
+
+// isWindowsNulName reports whether name is os.DevNull ('NUL') on Windows.
+// True is returned if name is 'NUL' whatever the case.
+func isWindowsNulName(name string) bool {
+	if len(name) != 3 {
+		return false
+	}
+	if name[0] != 'n' && name[0] != 'N' {
+		return false
+	}
+	if name[1] != 'u' && name[1] != 'U' {
+		return false
+	}
+	if name[2] != 'l' && name[2] != 'L' {
+		return false
+	}
+	return true
 }

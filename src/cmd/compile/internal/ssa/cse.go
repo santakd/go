@@ -155,7 +155,7 @@ func cse(f *Func) {
 		}
 	}
 
-	sdom := f.sdom()
+	sdom := f.Sdom()
 
 	// Compute substitutions we would like to do. We substitute v for w
 	// if v and w are in the same equivalence class and v dominates w.
@@ -179,50 +179,13 @@ func cse(f *Func) {
 				if w == nil {
 					continue
 				}
-				if sdom.isAncestorEq(v.Block, w.Block) {
+				if sdom.IsAncestorEq(v.Block, w.Block) {
 					rewrite[w.ID] = v
 					e[j] = nil
 				} else {
 					// e is sorted by domorder, so v.Block doesn't dominate any subsequent blocks in e
 					break
 				}
-			}
-		}
-	}
-
-	// if we rewrite a tuple generator to a new one in a different block,
-	// copy its selectors to the new generator's block, so tuple generator
-	// and selectors stay together.
-	// be careful not to copy same selectors more than once (issue 16741).
-	copiedSelects := make(map[ID][]*Value)
-	for _, b := range f.Blocks {
-	out:
-		for _, v := range b.Values {
-			// New values are created when selectors are copied to
-			// a new block. We can safely ignore those new values,
-			// since they have already been copied (issue 17918).
-			if int(v.ID) >= len(rewrite) || rewrite[v.ID] != nil {
-				continue
-			}
-			if v.Op != OpSelect0 && v.Op != OpSelect1 {
-				continue
-			}
-			if !v.Args[0].Type.IsTuple() {
-				f.Fatalf("arg of tuple selector %s is not a tuple: %s", v.String(), v.Args[0].LongString())
-			}
-			t := rewrite[v.Args[0].ID]
-			if t != nil && t.Block != b {
-				// v.Args[0] is tuple generator, CSE'd into a different block as t, v is left behind
-				for _, c := range copiedSelects[t.ID] {
-					if v.Op == c.Op {
-						// an equivalent selector is already copied
-						rewrite[v.ID] = c
-						continue out
-					}
-				}
-				c := v.copyInto(t.Block)
-				rewrite[v.ID] = c
-				copiedSelects[t.ID] = append(copiedSelects[t.ID], c)
 			}
 		}
 	}
@@ -248,17 +211,72 @@ func cse(f *Func) {
 				}
 			}
 		}
-		if v := b.Control; v != nil {
+		for i, v := range b.ControlValues() {
 			if x := rewrite[v.ID]; x != nil {
 				if v.Op == OpNilCheck {
 					// nilcheck pass will remove the nil checks and log
 					// them appropriately, so don't mess with them here.
 					continue
 				}
-				b.SetControl(x)
+				b.ReplaceControl(i, x)
 			}
 		}
 	}
+
+	// Fixup tuple selectors.
+	//
+	// If we have rewritten a tuple generator to a new one in a different
+	// block, copy its selectors to the new generator's block, so tuple
+	// generator and selectors stay together.
+	//
+	// Note: that there must be only one selector of each type per tuple
+	// generator. CSE may have left us with more than one so we de-duplicate
+	// them using a map. See issue 16741.
+	selectors := make(map[struct {
+		id ID
+		op Op
+	}]*Value)
+	for _, b := range f.Blocks {
+		for _, selector := range b.Values {
+			if selector.Op != OpSelect0 && selector.Op != OpSelect1 {
+				continue
+			}
+
+			// Get the tuple generator to use as a key for de-duplication.
+			tuple := selector.Args[0]
+			if !tuple.Type.IsTuple() {
+				f.Fatalf("arg of tuple selector %s is not a tuple: %s", selector.String(), tuple.LongString())
+			}
+
+			// If there is a pre-existing selector in the target block then
+			// use that. Do this even if the selector is already in the
+			// target block to avoid duplicate tuple selectors.
+			key := struct {
+				id ID
+				op Op
+			}{tuple.ID, selector.Op}
+			if t := selectors[key]; t != nil {
+				if selector != t {
+					selector.copyOf(t)
+				}
+				continue
+			}
+
+			// If the selector is in the wrong block copy it into the target
+			// block.
+			if selector.Block != tuple.Block {
+				t := selector.copyInto(tuple.Block)
+				selector.copyOf(t)
+				selectors[key] = t
+				continue
+			}
+
+			// The selector is in the target block. Add it to the map so it
+			// cannot be duplicated.
+			selectors[key] = selector
+		}
+	}
+
 	if f.pass.stats > 0 {
 		f.LogStat("CSE REWRITES", rewrites)
 	}

@@ -126,12 +126,12 @@ func (w *gcWork) checkPut(ptr uintptr, ptrs []uintptr) {
 	if debugCachedWork {
 		alreadyFailed := w.putGen == w.pauseGen
 		w.putGen = w.pauseGen
-		if m := getg().m; m.locks > 0 || m.mallocing != 0 || m.preemptoff != "" || m.p.ptr().status != _Prunning {
+		if !canPreemptM(getg().m) {
 			// If we were to spin, the runtime may
-			// deadlock: the condition above prevents
-			// preemption (see newstack), which could
-			// prevent gcMarkDone from finishing the
-			// ragged barrier and releasing the spin.
+			// deadlock. Since we can't be preempted, the
+			// spin could prevent gcMarkDone from
+			// finishing the ragged barrier, which is what
+			// releases us from the spin.
 			return
 		}
 		for atomic.Load(&gcWorkPauseGen) == w.pauseGen {
@@ -178,6 +178,10 @@ func (w *gcWork) put(obj uintptr) {
 
 	flushed := false
 	wbuf := w.wbuf1
+	// Record that this may acquire the wbufSpans or heap lock to
+	// allocate a workbuf.
+	lockWithRankMayAcquire(&work.wbufSpans.lock, lockRankWbufSpans)
+	lockWithRankMayAcquire(&mheap_.lock, lockRankMheap)
 	if wbuf == nil {
 		w.init()
 		wbuf = w.wbuf1
@@ -423,6 +427,10 @@ func getempty() *workbuf {
 			b.checkempty()
 		}
 	}
+	// Record that this may acquire the wbufSpans or heap lock to
+	// allocate a workbuf.
+	lockWithRankMayAcquire(&work.wbufSpans.lock, lockRankWbufSpans)
+	lockWithRankMayAcquire(&mheap_.lock, lockRankMheap)
 	if b == nil {
 		// Allocate more workbufs.
 		var s *mspan

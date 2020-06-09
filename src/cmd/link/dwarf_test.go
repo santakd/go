@@ -72,6 +72,7 @@ func testDWARF(t *testing.T, buildmode string, expectDWARF bool, env ...string) 
 			cmd.Args = append(cmd.Args, dir)
 			if env != nil {
 				cmd.Env = append(os.Environ(), env...)
+				cmd.Env = append(cmd.Env, "CGO_CFLAGS=") // ensure CGO_CFLAGS does not contain any flags. Issue #35459
 			}
 			out, err := cmd.CombinedOutput()
 			if err != nil {
@@ -93,11 +94,13 @@ func testDWARF(t *testing.T, buildmode string, expectDWARF bool, env ...string) 
 					// Ensure Apple's tooling can parse our object for symbols.
 					out, err = exec.Command("symbols", exe).CombinedOutput()
 					if err != nil {
-						t.Fatal(err)
+						t.Fatalf("symbols %v: %v: %s", filepath.Base(exe), err, out)
 					} else {
 						if bytes.HasPrefix(out, []byte("Unable to find file")) {
 							// This failure will cause the App Store to reject our binaries.
-							t.Fatalf("/usr/bin/symbols %v: failed to parse file", filepath.Base(exe))
+							t.Fatalf("symbols %v: failed to parse file", filepath.Base(exe))
+						} else if bytes.Contains(out, []byte(", Empty]")) {
+							t.Fatalf("symbols %v: parsed as empty", filepath.Base(exe))
 						}
 					}
 				}
@@ -165,8 +168,13 @@ func testDWARF(t *testing.T, buildmode string, expectDWARF bool, env ...string) 
 
 func TestDWARF(t *testing.T) {
 	testDWARF(t, "", true)
-	if runtime.GOOS == "darwin" {
-		testDWARF(t, "c-archive", true)
+	if !testing.Short() {
+		if runtime.GOOS == "windows" {
+			t.Skip("skipping Windows/c-archive; see Issue 35512 for more.")
+		}
+		t.Run("c-archive", func(t *testing.T) {
+			testDWARF(t, "c-archive", true)
+		})
 	}
 }
 
@@ -185,9 +193,7 @@ func TestDWARFiOS(t *testing.T) {
 	}
 	cc := "CC=" + runtime.GOROOT() + "/misc/ios/clangwrap.sh"
 	// iOS doesn't allow unmapped segments, so iOS executables don't have DWARF.
-	testDWARF(t, "", false, cc, "CGO_ENABLED=1", "GOOS=darwin", "GOARCH=arm", "GOARM=7")
 	testDWARF(t, "", false, cc, "CGO_ENABLED=1", "GOOS=darwin", "GOARCH=arm64")
 	// However, c-archive iOS objects have embedded DWARF.
-	testDWARF(t, "c-archive", true, cc, "CGO_ENABLED=1", "GOOS=darwin", "GOARCH=arm", "GOARM=7")
 	testDWARF(t, "c-archive", true, cc, "CGO_ENABLED=1", "GOOS=darwin", "GOARCH=arm64")
 }

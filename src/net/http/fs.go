@@ -384,15 +384,18 @@ func checkIfUnmodifiedSince(r *Request, modtime time.Time) condResult {
 	if ius == "" || isZeroTime(modtime) {
 		return condNone
 	}
-	if t, err := ParseTime(ius); err == nil {
-		// The Date-Modified header truncates sub-second precision, so
-		// use mtime < t+1s instead of mtime <= t to check for unmodified.
-		if modtime.Before(t.Add(1 * time.Second)) {
-			return condTrue
-		}
-		return condFalse
+	t, err := ParseTime(ius)
+	if err != nil {
+		return condNone
 	}
-	return condNone
+
+	// The Last-Modified header truncates sub-second precision so
+	// the modtime needs to be truncated too.
+	modtime = modtime.Truncate(time.Second)
+	if modtime.Before(t) || modtime.Equal(t) {
+		return condTrue
+	}
+	return condFalse
 }
 
 func checkIfNoneMatch(w ResponseWriter, r *Request) condResult {
@@ -436,9 +439,10 @@ func checkIfModifiedSince(r *Request, modtime time.Time) condResult {
 	if err != nil {
 		return condNone
 	}
-	// The Date-Modified header truncates sub-second precision, so
-	// use mtime < t+1s instead of mtime <= t to check for unmodified.
-	if modtime.Before(t.Add(1 * time.Second)) {
+	// The Last-Modified header truncates sub-second precision so
+	// the modtime needs to be truncated too.
+	modtime = modtime.Truncate(time.Second)
+	if modtime.Before(t) || modtime.Equal(t) {
 		return condFalse
 	}
 	return condTrue
@@ -582,17 +586,15 @@ func serveFile(w ResponseWriter, r *Request, fs FileSystem, name string, redirec
 		}
 	}
 
-	// redirect if the directory name doesn't end in a slash
 	if d.IsDir() {
 		url := r.URL.Path
-		if url[len(url)-1] != '/' {
+		// redirect if the directory name doesn't end in a slash
+		if url == "" || url[len(url)-1] != '/' {
 			localRedirect(w, r, path.Base(url)+"/")
 			return
 		}
-	}
 
-	// use contents of index.html for directory, if present
-	if d.IsDir() {
+		// use contents of index.html for directory, if present
 		index := strings.TrimSuffix(name, "/") + indexPage
 		ff, err := fs.Open(index)
 		if err == nil {
@@ -612,7 +614,7 @@ func serveFile(w ResponseWriter, r *Request, fs FileSystem, name string, redirec
 			writeNotModified(w)
 			return
 		}
-		w.Header().Set("Last-Modified", d.ModTime().UTC().Format(TimeFormat))
+		setLastModified(w, d.ModTime())
 		dirList(w, r, f)
 		return
 	}
@@ -754,7 +756,7 @@ func parseRange(s string, size int64) ([]httpRange, error) {
 	var ranges []httpRange
 	noOverlap := false
 	for _, ra := range strings.Split(s[len(b):], ",") {
-		ra = strings.TrimSpace(ra)
+		ra = textproto.TrimString(ra)
 		if ra == "" {
 			continue
 		}
@@ -762,7 +764,7 @@ func parseRange(s string, size int64) ([]httpRange, error) {
 		if i < 0 {
 			return nil, errors.New("invalid range")
 		}
-		start, end := strings.TrimSpace(ra[:i]), strings.TrimSpace(ra[i+1:])
+		start, end := textproto.TrimString(ra[:i]), textproto.TrimString(ra[i+1:])
 		var r httpRange
 		if start == "" {
 			// If no start is specified, end specifies the

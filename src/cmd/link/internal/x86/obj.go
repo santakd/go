@@ -1,5 +1,5 @@
 // Inferno utils/8l/obj.c
-// https://bitbucket.org/inferno-os/inferno-os/src/default/utils/8l/obj.c
+// https://bitbucket.org/inferno-os/inferno-os/src/master/utils/8l/obj.c
 //
 //	Copyright © 1994-1999 Lucent Technologies Inc.  All rights reserved.
 //	Portions Copyright © 1995-1997 C H Forsyth (forsyth@terzarima.net)
@@ -46,15 +46,15 @@ func Init() (*sys.Arch, ld.Arch) {
 		Dwarfregsp: dwarfRegSP,
 		Dwarfreglr: dwarfRegLR,
 
-		Adddynrel:        adddynrel,
+		Adddynrel2:       adddynrel2,
 		Archinit:         archinit,
-		Archreloc:        archreloc,
+		Archreloc2:       archreloc2,
 		Archrelocvariant: archrelocvariant,
 		Asmb:             asmb,
 		Asmb2:            asmb2,
 		Elfreloc1:        elfreloc1,
 		Elfsetupplt:      elfsetupplt,
-		Gentext:          gentext,
+		Gentext2:         gentext2,
 		Machoreloc1:      machoreloc1,
 		PEreloc1:         pereloc1,
 
@@ -104,17 +104,6 @@ func archinit(ctxt *ld.Link) {
 		}
 		if *ld.FlagRound == -1 {
 			*ld.FlagRound = 4096
-		}
-
-	case objabi.Hnacl:
-		ld.Elfinit(ctxt)
-		ld.HEADR = 0x10000
-		ld.Funcalign = 32
-		if *ld.FlagTextAddr == -1 {
-			*ld.FlagTextAddr = 0x20000
-		}
-		if *ld.FlagRound == -1 {
-			*ld.FlagRound = 0x10000
 		}
 
 	case objabi.Hwindows: /* PE executable */

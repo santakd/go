@@ -19,7 +19,7 @@ import (
 
 type URLTest struct {
 	in        string
-	out       *URL   // expected parse; RawPath="" means same as Path
+	out       *URL   // expected parse
 	roundtrip string // expected result of reserializing the URL; empty means same as "in".
 }
 
@@ -51,6 +51,18 @@ var urltests = []URLTest{
 			Host:    "www.google.com",
 			Path:    "/file one&two",
 			RawPath: "/file%20one%26two",
+		},
+		"",
+	},
+	// fragment with hex escaping
+	{
+		"http://www.google.com/#file%20one%26two",
+		&URL{
+			Scheme:      "http",
+			Host:        "www.google.com",
+			Path:        "/",
+			Fragment:    "file one&two",
+			RawFragment: "file%20one%26two",
 		},
 		"",
 	},
@@ -261,7 +273,7 @@ var urltests = []URLTest{
 		"",
 	},
 	{
-		"http://www.google.com/?q=go+language#foo%26bar",
+		"http://www.google.com/?q=go+language#foo&bar",
 		&URL{
 			Scheme:   "http",
 			Host:     "www.google.com",
@@ -270,6 +282,18 @@ var urltests = []URLTest{
 			Fragment: "foo&bar",
 		},
 		"http://www.google.com/?q=go+language#foo&bar",
+	},
+	{
+		"http://www.google.com/?q=go+language#foo%26bar",
+		&URL{
+			Scheme:      "http",
+			Host:        "www.google.com",
+			Path:        "/",
+			RawQuery:    "q=go+language",
+			Fragment:    "foo&bar",
+			RawFragment: "foo%26bar",
+		},
+		"http://www.google.com/?q=go+language#foo%26bar",
 	},
 	{
 		"file:///home/adg/rabbits",
@@ -422,10 +446,10 @@ var urltests = []URLTest{
 	},
 	// worst case host, still round trips
 	{
-		"scheme://!$&'()*+,;=hello!:port/path",
+		"scheme://!$&'()*+,;=hello!:1/path",
 		&URL{
 			Scheme: "scheme",
-			Host:   "!$&'()*+,;=hello!:port",
+			Host:   "!$&'()*+,;=hello!:1",
 			Path:   "/path",
 		},
 		"",
@@ -601,8 +625,8 @@ func ufmt(u *URL) string {
 			pass = p
 		}
 	}
-	return fmt.Sprintf("opaque=%q, scheme=%q, user=%#v, pass=%#v, host=%q, path=%q, rawpath=%q, rawq=%q, frag=%q, forcequery=%v",
-		u.Opaque, u.Scheme, user, pass, u.Host, u.Path, u.RawPath, u.RawQuery, u.Fragment, u.ForceQuery)
+	return fmt.Sprintf("opaque=%q, scheme=%q, user=%#v, pass=%#v, host=%q, path=%q, rawpath=%q, rawq=%q, frag=%q, rawfrag=%q, forcequery=%v",
+		u.Opaque, u.Scheme, user, pass, u.Host, u.Path, u.RawPath, u.RawQuery, u.Fragment, u.RawFragment, u.ForceQuery)
 }
 
 func BenchmarkString(b *testing.B) {
@@ -668,6 +692,7 @@ var parseRequestURLTests = []struct {
 
 	{"foo.html", false},
 	{"../dir/", false},
+	{" http://foo.com", false},
 	{"http://192.168.0.%31/", false},
 	{"http://192.168.0.%31:8080/", false},
 	{"http://[fe80::%31]/", false},
@@ -761,6 +786,73 @@ func TestURLString(t *testing.T) {
 		if got := tt.url.String(); got != tt.want {
 			t.Errorf("%+v.String() = %q; want %q", tt.url, got, tt.want)
 		}
+	}
+}
+
+func TestURLRedacted(t *testing.T) {
+	cases := []struct {
+		name string
+		url  *URL
+		want string
+	}{
+		{
+			name: "non-blank Password",
+			url: &URL{
+				Scheme: "http",
+				Host:   "host.tld",
+				Path:   "this:that",
+				User:   UserPassword("user", "password"),
+			},
+			want: "http://user:xxxxx@host.tld/this:that",
+		},
+		{
+			name: "blank Password",
+			url: &URL{
+				Scheme: "http",
+				Host:   "host.tld",
+				Path:   "this:that",
+				User:   User("user"),
+			},
+			want: "http://user@host.tld/this:that",
+		},
+		{
+			name: "nil User",
+			url: &URL{
+				Scheme: "http",
+				Host:   "host.tld",
+				Path:   "this:that",
+				User:   UserPassword("", "password"),
+			},
+			want: "http://:xxxxx@host.tld/this:that",
+		},
+		{
+			name: "blank Username, blank Password",
+			url: &URL{
+				Scheme: "http",
+				Host:   "host.tld",
+				Path:   "this:that",
+			},
+			want: "http://host.tld/this:that",
+		},
+		{
+			name: "empty URL",
+			url:  &URL{},
+			want: "",
+		},
+		{
+			name: "nil URL",
+			url:  nil,
+			want: "",
+		},
+	}
+
+	for _, tt := range cases {
+		t := t
+		t.Run(tt.name, func(t *testing.T) {
+			if g, w := tt.url.Redacted(), tt.want; g != w {
+				t.Fatalf("got: %q\nwant: %q", g, w)
+			}
+		})
 	}
 }
 
@@ -1425,18 +1517,25 @@ func TestParseErrors(t *testing.T) {
 		{"http://[::1]", false},
 		{"http://[::1]:80", false},
 		{"http://[::1]:namedport", true}, // rfc3986 3.2.3
+		{"http://x:namedport", true},     // rfc3986 3.2.3
 		{"http://[::1]/", false},
 		{"http://[::1]a", true},
 		{"http://[::1]%23", true},
-		{"http://[::1%25en0]", false},     // valid zone id
-		{"http://[::1]:", false},          // colon, but no port OK
-		{"http://[::1]:%38%30", true},     // not allowed: % encoding only for non-ASCII
-		{"http://[::1%25%41]", false},     // RFC 6874 allows over-escaping in zone
-		{"http://[%10::1]", true},         // no %xx escapes in IP address
-		{"http://[::1]/%48", false},       // %xx in path is fine
-		{"http://%41:8080/", true},        // not allowed: % encoding only for non-ASCII
-		{"mysql://x@y(z:123)/foo", false}, // golang.org/issue/12023
-		{"mysql://x@y(1.2.3.4:123)/foo", false},
+		{"http://[::1%25en0]", false},    // valid zone id
+		{"http://[::1]:", false},         // colon, but no port OK
+		{"http://x:", false},             // colon, but no port OK
+		{"http://[::1]:%38%30", true},    // not allowed: % encoding only for non-ASCII
+		{"http://[::1%25%41]", false},    // RFC 6874 allows over-escaping in zone
+		{"http://[%10::1]", true},        // no %xx escapes in IP address
+		{"http://[::1]/%48", false},      // %xx in path is fine
+		{"http://%41:8080/", true},       // not allowed: % encoding only for non-ASCII
+		{"mysql://x@y(z:123)/foo", true}, // not well-formed per RFC 3986, golang.org/issue/33646
+		{"mysql://x@y(1.2.3.4:123)/foo", true},
+
+		{" http://foo.com", true},  // invalid character in schema
+		{"ht tp://foo.com", true},  // invalid character in schema
+		{"ahttp://foo.com", false}, // valid schema characters
+		{"1http://foo.com", true},  // invalid character in schema
 
 		{"http://[]%20%48%54%54%50%2f%31%2e%31%0a%4d%79%48%65%61%64%65%72%3a%20%31%32%33%0a%0a/", true}, // golang.org/issue/11208
 		{"http://a b.com/", true},    // no space in host name please
@@ -1454,7 +1553,7 @@ func TestParseErrors(t *testing.T) {
 			continue
 		}
 		if err != nil {
-			t.Logf("Parse(%q) = %v; want no error", tt.in, err)
+			t.Errorf("Parse(%q) = %v; want no error", tt.in, err)
 		}
 	}
 }
@@ -1621,46 +1720,46 @@ func TestURLErrorImplementsNetError(t *testing.T) {
 	}
 }
 
-func TestURLHostname(t *testing.T) {
+func TestURLHostnameAndPort(t *testing.T) {
 	tests := []struct {
-		host string // URL.Host field
-		want string
+		in   string // URL.Host field
+		host string
+		port string
 	}{
-		{"foo.com:80", "foo.com"},
-		{"foo.com", "foo.com"},
-		{"FOO.COM", "FOO.COM"}, // no canonicalization (yet?)
-		{"1.2.3.4", "1.2.3.4"},
-		{"1.2.3.4:80", "1.2.3.4"},
-		{"[1:2:3:4]", "1:2:3:4"},
-		{"[1:2:3:4]:80", "1:2:3:4"},
-		{"[::1]:80", "::1"},
-	}
-	for _, tt := range tests {
-		u := &URL{Host: tt.host}
-		got := u.Hostname()
-		if got != tt.want {
-			t.Errorf("Hostname for Host %q = %q; want %q", tt.host, got, tt.want)
-		}
-	}
-}
+		{"foo.com:80", "foo.com", "80"},
+		{"foo.com", "foo.com", ""},
+		{"foo.com:", "foo.com", ""},
+		{"FOO.COM", "FOO.COM", ""}, // no canonicalization
+		{"1.2.3.4", "1.2.3.4", ""},
+		{"1.2.3.4:80", "1.2.3.4", "80"},
+		{"[1:2:3:4]", "1:2:3:4", ""},
+		{"[1:2:3:4]:80", "1:2:3:4", "80"},
+		{"[::1]:80", "::1", "80"},
+		{"[::1]", "::1", ""},
+		{"[::1]:", "::1", ""},
+		{"localhost", "localhost", ""},
+		{"localhost:443", "localhost", "443"},
+		{"some.super.long.domain.example.org:8080", "some.super.long.domain.example.org", "8080"},
+		{"[2001:0db8:85a3:0000:0000:8a2e:0370:7334]:17000", "2001:0db8:85a3:0000:0000:8a2e:0370:7334", "17000"},
+		{"[2001:0db8:85a3:0000:0000:8a2e:0370:7334]", "2001:0db8:85a3:0000:0000:8a2e:0370:7334", ""},
 
-func TestURLPort(t *testing.T) {
-	tests := []struct {
-		host string // URL.Host field
-		want string
-	}{
-		{"foo.com", ""},
-		{"foo.com:80", "80"},
-		{"1.2.3.4", ""},
-		{"1.2.3.4:80", "80"},
-		{"[1:2:3:4]", ""},
-		{"[1:2:3:4]:80", "80"},
+		// Ensure that even when not valid, Host is one of "Hostname",
+		// "Hostname:Port", "[Hostname]" or "[Hostname]:Port".
+		// See https://golang.org/issue/29098.
+		{"[google.com]:80", "google.com", "80"},
+		{"google.com]:80", "google.com]", "80"},
+		{"google.com:80_invalid_port", "google.com:80_invalid_port", ""},
+		{"[::1]extra]:80", "::1]extra", "80"},
+		{"google.com]extra:extra", "google.com]extra:extra", ""},
 	}
 	for _, tt := range tests {
-		u := &URL{Host: tt.host}
-		got := u.Port()
-		if got != tt.want {
-			t.Errorf("Port for Host %q = %q; want %q", tt.host, got, tt.want)
+		u := &URL{Host: tt.in}
+		host, port := u.Hostname(), u.Port()
+		if host != tt.host {
+			t.Errorf("Hostname for Host %q = %q; want %q", tt.in, host, tt.host)
+		}
+		if port != tt.port {
+			t.Errorf("Port for Host %q = %q; want %q", tt.in, port, tt.port)
 		}
 	}
 }
@@ -1870,5 +1969,14 @@ func BenchmarkPathUnescape(b *testing.B) {
 			}
 
 		})
+	}
+}
+
+var sink string
+
+func BenchmarkSplit(b *testing.B) {
+	url := "http://www.google.com/?q=go+language#foo%26bar"
+	for i := 0; i < b.N; i++ {
+		sink, sink = split(url, '#', true)
 	}
 }

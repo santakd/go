@@ -51,6 +51,7 @@ import (
 	"errors"
 	"internal/reflectlite"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -67,6 +68,8 @@ type Context interface {
 	// Done returns a channel that's closed when work done on behalf of this
 	// context should be canceled. Done may return nil if this context can
 	// never be canceled. Successive calls to Done return the same value.
+	// The close of the Done channel may happen asynchronously,
+	// after the cancel function returns.
 	//
 	// WithCancel arranges for Done to be closed when cancel is called;
 	// WithDeadline arranges for Done to be closed when the deadline
@@ -216,6 +219,7 @@ func TODO() Context {
 
 // A CancelFunc tells an operation to abandon its work.
 // A CancelFunc does not wait for the work to stop.
+// A CancelFunc may be called by multiple goroutines simultaneously.
 // After the first call, subsequent calls to a CancelFunc do nothing.
 type CancelFunc func()
 
@@ -226,6 +230,9 @@ type CancelFunc func()
 // Canceling this context releases resources associated with it, so code should
 // call cancel as soon as the operations running in this Context complete.
 func WithCancel(parent Context) (ctx Context, cancel CancelFunc) {
+	if parent == nil {
+		panic("cannot create context from nil parent")
+	}
 	c := newCancelCtx(parent)
 	propagateCancel(parent, &c)
 	return &c, func() { c.cancel(true, Canceled) }
@@ -236,11 +243,24 @@ func newCancelCtx(parent Context) cancelCtx {
 	return cancelCtx{Context: parent}
 }
 
+// goroutines counts the number of goroutines ever created; for testing.
+var goroutines int32
+
 // propagateCancel arranges for child to be canceled when parent is.
 func propagateCancel(parent Context, child canceler) {
-	if parent.Done() == nil {
+	done := parent.Done()
+	if done == nil {
 		return // parent is never canceled
 	}
+
+	select {
+	case <-done:
+		// parent is already canceled
+		child.cancel(false, parent.Err())
+		return
+	default:
+	}
+
 	if p, ok := parentCancelCtx(parent); ok {
 		p.mu.Lock()
 		if p.err != nil {
@@ -254,6 +274,7 @@ func propagateCancel(parent Context, child canceler) {
 		}
 		p.mu.Unlock()
 	} else {
+		atomic.AddInt32(&goroutines, +1)
 		go func() {
 			select {
 			case <-parent.Done():
@@ -264,22 +285,31 @@ func propagateCancel(parent Context, child canceler) {
 	}
 }
 
-// parentCancelCtx follows a chain of parent references until it finds a
-// *cancelCtx. This function understands how each of the concrete types in this
-// package represents its parent.
+// &cancelCtxKey is the key that a cancelCtx returns itself for.
+var cancelCtxKey int
+
+// parentCancelCtx returns the underlying *cancelCtx for parent.
+// It does this by looking up parent.Value(&cancelCtxKey) to find
+// the innermost enclosing *cancelCtx and then checking whether
+// parent.Done() matches that *cancelCtx. (If not, the *cancelCtx
+// has been wrapped in a custom implementation providing a
+// different done channel, in which case we should not bypass it.)
 func parentCancelCtx(parent Context) (*cancelCtx, bool) {
-	for {
-		switch c := parent.(type) {
-		case *cancelCtx:
-			return c, true
-		case *timerCtx:
-			return &c.cancelCtx, true
-		case *valueCtx:
-			parent = c.Context
-		default:
-			return nil, false
-		}
+	done := parent.Done()
+	if done == closedchan || done == nil {
+		return nil, false
 	}
+	p, ok := parent.Value(&cancelCtxKey).(*cancelCtx)
+	if !ok {
+		return nil, false
+	}
+	p.mu.Lock()
+	ok = p.done == done
+	p.mu.Unlock()
+	if !ok {
+		return nil, false
+	}
+	return p, true
 }
 
 // removeChild removes a context from its parent.
@@ -318,6 +348,13 @@ type cancelCtx struct {
 	done     chan struct{}         // created lazily, closed by first cancel call
 	children map[canceler]struct{} // set to nil by the first cancel call
 	err      error                 // set to non-nil by the first cancel call
+}
+
+func (c *cancelCtx) Value(key interface{}) interface{} {
+	if key == &cancelCtxKey {
+		return c
+	}
+	return c.Context.Value(key)
 }
 
 func (c *cancelCtx) Done() <-chan struct{} {
@@ -391,6 +428,9 @@ func (c *cancelCtx) cancel(removeFromParent bool, err error) {
 // Canceling this context releases resources associated with it, so code should
 // call cancel as soon as the operations running in this Context complete.
 func WithDeadline(parent Context, d time.Time) (Context, CancelFunc) {
+	if parent == nil {
+		panic("cannot create context from nil parent")
+	}
 	if cur, ok := parent.Deadline(); ok && cur.Before(d) {
 		// The current deadline is already sooner than the new one.
 		return WithCancel(parent)
@@ -477,6 +517,9 @@ func WithTimeout(parent Context, timeout time.Duration) (Context, CancelFunc) {
 // struct{}. Alternatively, exported context key variables' static
 // type should be a pointer or interface.
 func WithValue(parent Context, key, val interface{}) Context {
+	if parent == nil {
+		panic("cannot create context from nil parent")
+	}
 	if key == nil {
 		panic("nil key")
 	}

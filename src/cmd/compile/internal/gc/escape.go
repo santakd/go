@@ -5,8 +5,12 @@
 package gc
 
 import (
+	"cmd/compile/internal/logopt"
 	"cmd/compile/internal/types"
+	"cmd/internal/src"
 	"fmt"
+	"math"
+	"strings"
 )
 
 // Escape analysis.
@@ -24,7 +28,7 @@ import (
 // First, we construct a directed weighted graph where vertices
 // (termed "locations") represent variables allocated by statements
 // and expressions, and edges represent assignments between variables
-// (with weights reperesenting addressing/dereference counts).
+// (with weights representing addressing/dereference counts).
 //
 // Next we walk the graph looking for assignment paths that might
 // violate the invariants stated above. If a variable v's address is
@@ -33,7 +37,7 @@ import (
 //
 // To support interprocedural analysis, we also record data-flow from
 // each function's parameters to the heap and to its result
-// parameters. This information is summarized as "paremeter tags",
+// parameters. This information is summarized as "parameter tags",
 // which are used at static call sites to improve escape analysis of
 // function arguments.
 
@@ -44,7 +48,7 @@ import (
 // "location."
 //
 // We also model every Go assignment as a directed edges between
-// locations. The number of derefence operations minus the number of
+// locations. The number of dereference operations minus the number of
 // addressing operations is recorded as the edge's weight (termed
 // "derefs"). For example:
 //
@@ -100,10 +104,20 @@ type EscLocation struct {
 	edges     []EscEdge // incoming edges
 	loopDepth int       // loopDepth at declaration
 
-	// derefs and walkgen are used during walk to track the
+	// derefs and walkgen are used during walkOne to track the
 	// minimal dereferences from the walk root.
 	derefs  int // >= -1
 	walkgen uint32
+
+	// dst and dstEdgeindex track the next immediate assignment
+	// destination location during walkone, along with the index
+	// of the edge pointing back to this location.
+	dst        *EscLocation
+	dstEdgeIdx int
+
+	// queued is used by walkAll to track whether this location is
+	// in the walk queue.
+	queued bool
 
 	// escapes reports whether the represented variable's address
 	// escapes; that is, whether the variable must be heap
@@ -115,15 +129,15 @@ type EscLocation struct {
 	// its storage can be immediately reused.
 	transient bool
 
-	// paramEsc records the represented parameter's escape tags.
-	// See "Parameter tags" below for details.
-	paramEsc uint16
+	// paramEsc records the represented parameter's leak set.
+	paramEsc EscLeaks
 }
 
 // An EscEdge represents an assignment edge between two Go variables.
 type EscEdge struct {
 	src    *EscLocation
 	derefs int // >= -1
+	notes  *EscNote
 }
 
 // escapeFuncs performs escape analysis on a minimal batch of
@@ -136,6 +150,7 @@ func escapeFuncs(fns []*Node, recursive bool) {
 	}
 
 	var e Escape
+	e.heapLoc.escapes = true
 
 	// Construct data-flow graph from syntax trees.
 	for _, fn := range fns {
@@ -147,12 +162,7 @@ func escapeFuncs(fns []*Node, recursive bool) {
 	e.curfn = nil
 
 	e.walkAll()
-	e.finish()
-
-	// Record parameter tags for package export data.
-	for _, fn := range fns {
-		esctag(fn)
-	}
+	e.finish(fns)
 }
 
 func (e *Escape) initFunc(fn *Node) {
@@ -170,11 +180,7 @@ func (e *Escape) initFunc(fn *Node) {
 	// Allocate locations for local variables.
 	for _, dcl := range fn.Func.Dcl {
 		if dcl.Op == ONAME {
-			loc := e.newLoc(dcl, false)
-
-			if dcl.Class() == PPARAM && fn.Nbody.Len() == 0 && !fn.Noescape() {
-				loc.paramEsc = EscHeap
-			}
+			e.newLoc(dcl, false)
 		}
 	}
 }
@@ -201,7 +207,7 @@ func (e *Escape) walkFunc(fn *Node) {
 
 	e.curfn = fn
 	e.loopDepth = 1
-	e.stmts(fn.Nbody)
+	e.block(fn.Nbody)
 }
 
 // Below we implement the methods for walking the AST and recording
@@ -284,69 +290,61 @@ func (e *Escape) stmt(n *Node) {
 
 	case OIF:
 		e.discard(n.Left)
-		e.stmts(n.Nbody)
-		e.stmts(n.Rlist)
+		e.block(n.Nbody)
+		e.block(n.Rlist)
 
 	case OFOR, OFORUNTIL:
 		e.loopDepth++
 		e.discard(n.Left)
 		e.stmt(n.Right)
-		e.stmts(n.Nbody)
+		e.block(n.Nbody)
 		e.loopDepth--
 
 	case ORANGE:
 		// for List = range Right { Nbody }
-
-		// Right is evaluated outside the loop.
-		tv := e.newLoc(n, false)
-		e.expr(tv.asHole(), n.Right)
-
 		e.loopDepth++
 		ks := e.addrs(n.List)
-		if len(ks) >= 2 {
-			if n.Right.Type.IsArray() {
-				e.flow(ks[1].note(n, "range"), tv)
-			} else {
-				e.flow(ks[1].deref(n, "range-deref"), tv)
-			}
-		}
-
-		e.stmts(n.Nbody)
+		e.block(n.Nbody)
 		e.loopDepth--
 
-	case OSWITCH:
-		var tv *EscLocation
-		if n.Left != nil {
-			if n.Left.Op == OTYPESW {
-				k := e.discardHole()
-				if n.Left.Left != nil {
-					tv = e.newLoc(n.Left, false)
-					k = tv.asHole()
-				}
-				e.expr(k, n.Left.Right)
+		// Right is evaluated outside the loop.
+		k := e.discardHole()
+		if len(ks) >= 2 {
+			if n.Right.Type.IsArray() {
+				k = ks[1].note(n, "range")
 			} else {
-				e.discard(n.Left)
+				k = ks[1].deref(n, "range-deref")
 			}
 		}
+		e.expr(e.later(k), n.Right)
 
+	case OSWITCH:
+		typesw := n.Left != nil && n.Left.Op == OTYPESW
+
+		var ks []EscHole
 		for _, cas := range n.List.Slice() { // cases
-			if tv != nil {
-				// type switch variables have no ODCL.
+			if typesw && n.Left.Left != nil {
 				cv := cas.Rlist.First()
-				k := e.dcl(cv)
+				k := e.dcl(cv) // type switch variables have no ODCL.
 				if types.Haspointers(cv.Type) {
-					e.flow(k.dotType(cv.Type, n, "switch case"), tv)
+					ks = append(ks, k.dotType(cv.Type, cas, "switch case"))
 				}
 			}
 
 			e.discards(cas.List)
-			e.stmts(cas.Nbody)
+			e.block(cas.Nbody)
+		}
+
+		if typesw {
+			e.expr(e.teeHole(ks...), n.Left.Right)
+		} else {
+			e.discard(n.Left)
 		}
 
 	case OSELECT:
 		for _, cas := range n.List.Slice() {
 			e.stmt(cas.Left)
-			e.stmts(cas.Nbody)
+			e.block(cas.Nbody)
 		}
 	case OSELRECV:
 		e.assign(n.Left, n.Right, "selrecv", n)
@@ -369,18 +367,18 @@ func (e *Escape) stmt(n *Node) {
 		}
 
 	case OAS2DOTTYPE: // v, ok = x.(type)
-		e.assign(n.List.First(), n.Rlist.First(), "assign-pair-dot-type", n)
+		e.assign(n.List.First(), n.Right, "assign-pair-dot-type", n)
 		e.assign(n.List.Second(), nil, "assign-pair-dot-type", n)
 	case OAS2MAPR: // v, ok = m[k]
-		e.assign(n.List.First(), n.Rlist.First(), "assign-pair-mapr", n)
+		e.assign(n.List.First(), n.Right, "assign-pair-mapr", n)
 		e.assign(n.List.Second(), nil, "assign-pair-mapr", n)
 	case OAS2RECV: // v, ok = <-ch
-		e.assign(n.List.First(), n.Rlist.First(), "assign-pair-receive", n)
+		e.assign(n.List.First(), n.Right, "assign-pair-receive", n)
 		e.assign(n.List.Second(), nil, "assign-pair-receive", n)
 
 	case OAS2FUNC:
-		e.stmts(n.Rlist.First().Ninit)
-		e.call(e.addrs(n.List), n.Rlist.First(), nil)
+		e.stmts(n.Right.Ninit)
+		e.call(e.addrs(n.List), n.Right, nil)
 	case ORETURN:
 		results := e.curfn.Type.Results().FieldSlice()
 		for i, v := range n.List.Slice() {
@@ -398,10 +396,16 @@ func (e *Escape) stmt(n *Node) {
 }
 
 func (e *Escape) stmts(l Nodes) {
-	// TODO(mdempsky): Preserve and restore e.loopDepth? See also #22438.
 	for _, n := range l.Slice() {
 		e.stmt(n)
 	}
+}
+
+// block is like stmts, but preserves loopDepth.
+func (e *Escape) block(l Nodes) {
+	old := e.loopDepth
+	e.stmts(l)
+	e.loopDepth = old
 }
 
 // expr models evaluating an expression n and flowing the result into
@@ -424,7 +428,12 @@ func (e *Escape) exprSkipInit(k EscHole, n *Node) {
 		lineno = lno
 	}()
 
-	if k.derefs >= 0 && !types.Haspointers(n.Type) {
+	uintptrEscapesHack := k.uintptrEscapesHack
+	k.uintptrEscapesHack = false
+
+	if uintptrEscapesHack && n.Op == OCONVNOP && n.Left.Type.IsUnsafePtr() {
+		// nop
+	} else if k.derefs >= 0 && !types.Haspointers(n.Type) {
 		k = e.discardHole()
 	}
 
@@ -476,7 +485,15 @@ func (e *Escape) exprSkipInit(k EscHole, n *Node) {
 		e.discard(max)
 
 	case OCONV, OCONVNOP:
-		if n.Type.Etype == TUNSAFEPTR && n.Left.Type.Etype == TUINTPTR {
+		if checkPtr(e.curfn, 2) && n.Type.Etype == TUNSAFEPTR && n.Left.Type.IsPtr() {
+			// When -d=checkptr=2 is enabled, treat
+			// conversions to unsafe.Pointer as an
+			// escaping operation. This allows better
+			// runtime instrumentation, since we can more
+			// easily detect object boundaries on the heap
+			// than the stack.
+			e.assignHeap(n.Left, "conversion to unsafe.Pointer", n)
+		} else if n.Type.Etype == TUNSAFEPTR && n.Left.Type.Etype == TUINTPTR {
 			e.unsafeValue(k, n.Left)
 		} else {
 			e.expr(k, n.Left)
@@ -484,13 +501,6 @@ func (e *Escape) exprSkipInit(k EscHole, n *Node) {
 	case OCONVIFACE:
 		if !n.Left.Type.IsInterface() && !isdirectiface(n.Left.Type) {
 			k = e.spill(k, n)
-		} else {
-			// esc.go prints "escapes to heap" / "does not
-			// escape" messages for OCONVIFACE even when
-			// they don't allocate.  Match that behavior
-			// because it's easy.
-			// TODO(mdempsky): Remove and cleanup test expectations.
-			_ = e.spill(k, n)
 		}
 		e.expr(k.note(n, "interface-converted"), n.Left)
 
@@ -517,13 +527,26 @@ func (e *Escape) exprSkipInit(k EscHole, n *Node) {
 		// nop
 
 	case OCALLPART:
-		e.spill(k, n)
+		// Flow the receiver argument to both the closure and
+		// to the receiver parameter.
 
-		// esc.go says "Contents make it to memory, lose
-		// track."  I think we can just flow n.Left to our
-		// spilled location though.
-		// TODO(mdempsky): Try that.
-		e.assignHeap(n.Left, "call part", n)
+		closureK := e.spill(k, n)
+
+		m := callpartMethod(n)
+
+		// We don't know how the method value will be called
+		// later, so conservatively assume the result
+		// parameters all flow to the heap.
+		//
+		// TODO(mdempsky): Change ks into a callback, so that
+		// we don't have to create this dummy slice?
+		var ks []EscHole
+		for i := m.Type.NumResults(); i > 0; i-- {
+			ks = append(ks, e.heapHole())
+		}
+		paramK := e.tagHole(ks, asNode(m.Type.Nname()), m.Type.Recv())
+
+		e.expr(e.teeHole(paramK, closureK), n.Left)
 
 	case OPTRLIT:
 		e.expr(e.spill(k, n), n.Left)
@@ -538,6 +561,7 @@ func (e *Escape) exprSkipInit(k EscHole, n *Node) {
 
 	case OSLICELIT:
 		k = e.spill(k, n)
+		k.uintptrEscapesHack = uintptrEscapesHack // for ...uintptr parameters
 
 		for _, elt := range n.List.Slice() {
 			if elt.Op == OKEY {
@@ -614,9 +638,14 @@ func (e *Escape) unsafeValue(k EscHole, n *Node) {
 		}
 	case OPLUS, ONEG, OBITNOT:
 		e.unsafeValue(k, n.Left)
-	case OADD, OSUB, OOR, OXOR, OMUL, ODIV, OMOD, OLSH, ORSH, OAND, OANDNOT:
+	case OADD, OSUB, OOR, OXOR, OMUL, ODIV, OMOD, OAND, OANDNOT:
 		e.unsafeValue(k, n.Left)
 		e.unsafeValue(k, n.Right)
+	case OLSH, ORSH:
+		e.unsafeValue(k, n.Left)
+		// RHS need not be uintptr-typed (#32959) and can't meaningfully
+		// flow pointers anyway.
+		e.discard(n.Right)
 	default:
 		e.exprSkipInit(e.discardHole(), n)
 	}
@@ -694,12 +723,12 @@ func (e *Escape) assign(dst, src *Node, why string, where *Node) {
 
 	k := e.addr(dst)
 	if dst != nil && dst.Op == ODOTPTR && isReflectHeaderDataField(dst) {
-		e.unsafeValue(e.heapHole(), src)
+		e.unsafeValue(e.heapHole().note(where, why), src)
 	} else {
 		if ignore {
 			k = e.discardHole()
 		}
-		e.expr(k, src)
+		e.expr(k.note(where, why), src)
 	}
 }
 
@@ -711,208 +740,150 @@ func (e *Escape) assignHeap(src *Node, why string, where *Node) {
 // should contain the holes representing where the function callee's
 // results flows; where is the OGO/ODEFER context of the call, if any.
 func (e *Escape) call(ks []EscHole, call, where *Node) {
-	// First, pick out the function callee, its type, and receiver
-	// (if any) and normal arguments list.
-	var fn, recv *Node
-	var fntype *types.Type
-	args := call.List.Slice()
-	switch call.Op {
-	case OCALLFUNC:
-		fn = call.Left
-		if fn.Op == OCLOSURE {
-			fn = fn.Func.Closure.Func.Nname
-		}
-		fntype = fn.Type
-	case OCALLMETH:
-		fn = asNode(call.Left.Type.FuncType().Nname)
-		fntype = fn.Type
-		recv = call.Left.Left
-	case OCALLINTER:
-		fntype = call.Left.Type
-		recv = call.Left.Left
-	case OAPPEND, ODELETE, OPRINT, OPRINTN, ORECOVER:
-		// ok
-	case OLEN, OCAP, OREAL, OIMAG, OCLOSE, OPANIC:
-		args = []*Node{call.Left}
-	case OCOMPLEX, OCOPY:
-		args = []*Node{call.Left, call.Right}
-	default:
-		Fatalf("unexpected call op: %v", call.Op)
+	topLevelDefer := where != nil && where.Op == ODEFER && e.loopDepth == 1
+	if topLevelDefer {
+		// force stack allocation of defer record, unless
+		// open-coded defers are used (see ssa.go)
+		where.Esc = EscNever
 	}
 
-	static := fn != nil && fn.Op == ONAME && fn.Class() == PFUNC
-
-	// Setup evaluation holes for each receiver/argument.
-	var recvK EscHole
-	var paramKs []EscHole
-
-	if static && fn.Name.Defn != nil && fn.Name.Defn.Esc < EscFuncTagged {
-		// Static call to function in same mutually recursive
-		// group; incorporate into data flow graph.
-
-		if fn.Name.Defn.Esc == EscFuncUnknown {
-			Fatalf("graph inconsistency")
+	argument := func(k EscHole, arg *Node) {
+		if topLevelDefer {
+			// Top level defers arguments don't escape to
+			// heap, but they do need to last until end of
+			// function.
+			k = e.later(k)
+		} else if where != nil {
+			k = e.heapHole()
 		}
 
-		if ks != nil {
-			for i, result := range fntype.Results().FieldSlice() {
+		e.expr(k.note(call, "call parameter"), arg)
+	}
+
+	switch call.Op {
+	default:
+		Fatalf("unexpected call op: %v", call.Op)
+
+	case OCALLFUNC, OCALLMETH, OCALLINTER:
+		fixVariadicCall(call)
+
+		// Pick out the function callee, if statically known.
+		var fn *Node
+		switch call.Op {
+		case OCALLFUNC:
+			if call.Left.Op == ONAME && call.Left.Class() == PFUNC {
+				fn = call.Left
+			} else if call.Left.Op == OCLOSURE {
+				fn = call.Left.Func.Closure.Func.Nname
+			}
+		case OCALLMETH:
+			fn = asNode(call.Left.Type.FuncType().Nname)
+		}
+
+		fntype := call.Left.Type
+		if fn != nil {
+			fntype = fn.Type
+		}
+
+		if ks != nil && fn != nil && e.inMutualBatch(fn) {
+			for i, result := range fn.Type.Results().FieldSlice() {
 				e.expr(ks[i], asNode(result.Nname))
 			}
 		}
 
 		if r := fntype.Recv(); r != nil {
-			recvK = e.addr(asNode(r.Nname))
-		}
-		for _, param := range fntype.Params().FieldSlice() {
-			paramKs = append(paramKs, e.addr(asNode(param.Nname)))
-		}
-	} else if call.Op == OCALLFUNC || call.Op == OCALLMETH || call.Op == OCALLINTER {
-		// Dynamic call, or call to previously tagged
-		// function. Setup flows to heap and/or ks according
-		// to parameter tags.
-		if r := fntype.Recv(); r != nil {
-			recvK = e.tagHole(ks, r, static)
-		}
-		for _, param := range fntype.Params().FieldSlice() {
-			paramKs = append(paramKs, e.tagHole(ks, param, static))
-		}
-	} else {
-		// Handle escape analysis for builtins.
-		// By default, we just discard everything.
-		for range args {
-			paramKs = append(paramKs, e.discardHole())
+			argument(e.tagHole(ks, fn, r), call.Left.Left)
+		} else {
+			// Evaluate callee function expression.
+			argument(e.discardHole(), call.Left)
 		}
 
-		switch call.Op {
-		case OAPPEND:
-			// Appendee slice may flow directly to the
-			// result, if it has enough capacity.
-			// Alternatively, a new heap slice might be
-			// allocated, and all slice elements might
-			// flow to heap.
-			paramKs[0] = e.teeHole(paramKs[0], ks[0])
-			if types.Haspointers(args[0].Type.Elem()) {
-				paramKs[0] = e.teeHole(paramKs[0], e.heapHole().deref(call, "appendee slice"))
+		args := call.List.Slice()
+		for i, param := range fntype.Params().FieldSlice() {
+			argument(e.tagHole(ks, fn, param), args[i])
+		}
+
+	case OAPPEND:
+		args := call.List.Slice()
+
+		// Appendee slice may flow directly to the result, if
+		// it has enough capacity. Alternatively, a new heap
+		// slice might be allocated, and all slice elements
+		// might flow to heap.
+		appendeeK := ks[0]
+		if types.Haspointers(args[0].Type.Elem()) {
+			appendeeK = e.teeHole(appendeeK, e.heapHole().deref(call, "appendee slice"))
+		}
+		argument(appendeeK, args[0])
+
+		if call.IsDDD() {
+			appendedK := e.discardHole()
+			if args[1].Type.IsSlice() && types.Haspointers(args[1].Type.Elem()) {
+				appendedK = e.heapHole().deref(call, "appended slice...")
 			}
-
-			if call.IsDDD() {
-				if args[1].Type.IsSlice() && types.Haspointers(args[1].Type.Elem()) {
-					paramKs[1] = e.teeHole(paramKs[1], e.heapHole().deref(call, "appended slice..."))
-				}
-			} else {
-				for i := 1; i < len(args); i++ {
-					paramKs[i] = e.heapHole()
-				}
-			}
-
-		case OCOPY:
-			if call.Right.Type.IsSlice() && types.Haspointers(call.Right.Type.Elem()) {
-				paramKs[1] = e.teeHole(paramKs[1], e.heapHole().deref(call, "copied slice"))
-			}
-
-		case OPANIC:
-			paramKs[0] = e.heapHole()
-		}
-	}
-
-	if call.Op == OCALLFUNC {
-		// Evaluate callee function expression.
-		e.expr(e.augmentParamHole(e.discardHole(), where), call.Left)
-	}
-
-	if recv != nil {
-		// TODO(mdempsky): Handle go:uintptrescapes here too?
-		e.expr(e.augmentParamHole(recvK, where), recv)
-	}
-
-	// Apply augmentParamHole before ODDDARG so that it affects
-	// the implicit slice allocation for variadic calls, if any.
-	for i, paramK := range paramKs {
-		paramKs[i] = e.augmentParamHole(paramK, where)
-	}
-
-	// TODO(mdempsky): Remove after early ddd-ification.
-	if fntype != nil && fntype.IsVariadic() && !call.IsDDD() {
-		vi := fntype.NumParams() - 1
-
-		elt := fntype.Params().Field(vi).Type.Elem()
-		nva := call.List.Len()
-		nva -= vi
-
-		// Introduce ODDDARG node to represent ... allocation.
-		ddd := nodl(call.Pos, ODDDARG, nil, nil)
-		ddd.Type = types.NewPtr(types.NewArray(elt, int64(nva)))
-		call.Right = ddd
-
-		dddK := e.spill(paramKs[vi], ddd)
-		paramKs = paramKs[:vi]
-		for i := 0; i < nva; i++ {
-			paramKs = append(paramKs, dddK)
-		}
-	}
-
-	for i, arg := range args {
-		// For arguments to go:uintptrescapes, peel
-		// away an unsafe.Pointer->uintptr conversion,
-		// if present.
-		if static && arg.Op == OCONVNOP && arg.Type.Etype == TUINTPTR && arg.Left.Type.Etype == TUNSAFEPTR {
-			x := i
-			if fntype.IsVariadic() && x >= fntype.NumParams() {
-				x = fntype.NumParams() - 1
-			}
-			if fntype.Params().Field(x).Note == uintptrEscapesTag {
-				arg = arg.Left
+			argument(appendedK, args[1])
+		} else {
+			for _, arg := range args[1:] {
+				argument(e.heapHole(), arg)
 			}
 		}
 
-		// no augmentParamHole here; handled in loop before ODDDARG
-		e.expr(paramKs[i], arg)
-	}
-}
+	case OCOPY:
+		argument(e.discardHole(), call.Left)
 
-// augmentParamHole augments parameter holes as necessary for use in
-// go/defer statements.
-func (e *Escape) augmentParamHole(k EscHole, where *Node) EscHole {
-	if where == nil {
-		return k
-	}
+		copiedK := e.discardHole()
+		if call.Right.Type.IsSlice() && types.Haspointers(call.Right.Type.Elem()) {
+			copiedK = e.heapHole().deref(call, "copied slice")
+		}
+		argument(copiedK, call.Right)
 
-	// Top level defers arguments don't escape to heap, but they
-	// do need to last until end of function. Tee with a
-	// non-transient location to avoid arguments from being
-	// transiently allocated.
-	if where.Op == ODEFER && e.loopDepth == 1 {
-		// TODO(mdempsky): Eliminate redundant EscLocation allocs.
-		return e.teeHole(k, e.newLoc(nil, false).asHole())
-	}
+	case OPANIC:
+		argument(e.heapHole(), call.Left)
 
-	return e.heapHole()
+	case OCOMPLEX:
+		argument(e.discardHole(), call.Left)
+		argument(e.discardHole(), call.Right)
+	case ODELETE, OPRINT, OPRINTN, ORECOVER:
+		for _, arg := range call.List.Slice() {
+			argument(e.discardHole(), arg)
+		}
+	case OLEN, OCAP, OREAL, OIMAG, OCLOSE:
+		argument(e.discardHole(), call.Left)
+	}
 }
 
 // tagHole returns a hole for evaluating an argument passed to param.
 // ks should contain the holes representing where the function
-// callee's results flows; static indicates whether this is a static
-// call.
-func (e *Escape) tagHole(ks []EscHole, param *types.Field, static bool) EscHole {
+// callee's results flows. fn is the statically-known callee function,
+// if any.
+func (e *Escape) tagHole(ks []EscHole, fn *Node, param *types.Field) EscHole {
 	// If this is a dynamic call, we can't rely on param.Note.
-	if !static {
+	if fn == nil {
 		return e.heapHole()
 	}
 
-	esc := parsetag(param.Note)
-	switch esc {
-	case EscHeap, EscUnknown:
-		return e.heapHole()
+	if e.inMutualBatch(fn) {
+		return e.addr(asNode(param.Nname))
+	}
+
+	// Call to previously tagged function.
+
+	if param.Note == uintptrEscapesTag {
+		k := e.heapHole()
+		k.uintptrEscapesHack = true
+		return k
 	}
 
 	var tagKs []EscHole
-	if esc&EscContentEscapes != 0 {
-		tagKs = append(tagKs, e.heapHole().shift(1))
+
+	esc := ParseLeaks(param.Note)
+	if x := esc.Heap(); x >= 0 {
+		tagKs = append(tagKs, e.heapHole().shift(x))
 	}
 
 	if ks != nil {
-		for i := 0; i < numEscReturns; i++ {
-			if x := getEscReturn(esc, i); x >= 0 {
+		for i := 0; i < numEscResults; i++ {
+			if x := esc.Result(i); x >= 0 {
 				tagKs = append(tagKs, ks[i].shift(x))
 			}
 		}
@@ -921,16 +892,51 @@ func (e *Escape) tagHole(ks []EscHole, param *types.Field, static bool) EscHole 
 	return e.teeHole(tagKs...)
 }
 
+// inMutualBatch reports whether function fn is in the batch of
+// mutually recursive functions being analyzed. When this is true,
+// fn has not yet been analyzed, so its parameters and results
+// should be incorporated directly into the flow graph instead of
+// relying on its escape analysis tagging.
+func (e *Escape) inMutualBatch(fn *Node) bool {
+	if fn.Name.Defn != nil && fn.Name.Defn.Esc < EscFuncTagged {
+		if fn.Name.Defn.Esc == EscFuncUnknown {
+			Fatalf("graph inconsistency")
+		}
+		return true
+	}
+	return false
+}
+
 // An EscHole represents a context for evaluation a Go
 // expression. E.g., when evaluating p in "x = **p", we'd have a hole
 // with dst==x and derefs==2.
 type EscHole struct {
 	dst    *EscLocation
 	derefs int // >= -1
+	notes  *EscNote
+
+	// uintptrEscapesHack indicates this context is evaluating an
+	// argument for a //go:uintptrescapes function.
+	uintptrEscapesHack bool
+}
+
+type EscNote struct {
+	next  *EscNote
+	where *Node
+	why   string
 }
 
 func (k EscHole) note(where *Node, why string) EscHole {
-	// TODO(mdempsky): Keep a record of where/why for diagnostics.
+	if where == nil || why == "" {
+		Fatalf("note: missing where/why")
+	}
+	if Debug['m'] >= 2 || logopt.Enabled() {
+		k.notes = &EscNote{
+			next:  k.notes,
+			where: where,
+			why:   why,
+		}
+	}
 	return k
 }
 
@@ -988,21 +994,30 @@ func (e *Escape) dcl(n *Node) EscHole {
 	return loc.asHole()
 }
 
+// spill allocates a new location associated with expression n, flows
+// its address to k, and returns a hole that flows values to it. It's
+// intended for use with most expressions that allocate storage.
 func (e *Escape) spill(k EscHole, n *Node) EscHole {
-	// TODO(mdempsky): Optimize. E.g., if k is the heap or blank,
-	// then we already know whether n leaks, and we can return a
-	// more optimized hole.
 	loc := e.newLoc(n, true)
 	e.flow(k.addr(n, "spill"), loc)
+	return loc.asHole()
+}
+
+// later returns a new hole that flows into k, but some time later.
+// Its main effect is to prevent immediate reuse of temporary
+// variables introduced during Order.
+func (e *Escape) later(k EscHole) EscHole {
+	loc := e.newLoc(nil, false)
+	e.flow(k, loc)
 	return loc.asHole()
 }
 
 // canonicalNode returns the canonical *Node that n logically
 // represents.
 func canonicalNode(n *Node) *Node {
-	if n != nil && n.IsClosureVar() {
+	if n != nil && n.Op == ONAME && n.Name.IsClosureVar() {
 		n = n.Name.Defn
-		if n.IsClosureVar() {
+		if n.Name.IsClosureVar() {
 			Fatalf("still closure var")
 		}
 	}
@@ -1033,9 +1048,12 @@ func (e *Escape) newLoc(n *Node, transient bool) *EscLocation {
 		}
 		n.SetOpt(loc)
 
-		// TODO(mdempsky): Perhaps set n.Esc and then just return &HeapLoc?
-		if mustHeapAlloc(n) && !loc.isName(PPARAM) && !loc.isName(PPARAMOUT) {
-			e.flow(e.heapHole().addr(nil, ""), loc)
+		if mustHeapAlloc(n) {
+			why := "too large for stack"
+			if n.Op == OMAKESLICE && (!Isconst(n.Left, CTINT) || !Isconst(n.Right, CTINT)) {
+				why = "non-constant size"
+			}
+			e.flow(e.heapHole().addr(n, why), loc)
 		}
 	}
 	return loc
@@ -1055,13 +1073,27 @@ func (e *Escape) flow(k EscHole, src *EscLocation) {
 	if dst == &e.blankLoc {
 		return
 	}
-	if dst == src && k.derefs >= 0 {
+	if dst == src && k.derefs >= 0 { // dst = dst, dst = *dst, ...
 		return
 	}
-	// TODO(mdempsky): More optimizations?
+	if dst.escapes && k.derefs < 0 { // dst = &src
+		if Debug['m'] >= 2 || logopt.Enabled() {
+			pos := linestr(src.n.Pos)
+			if Debug['m'] >= 2 {
+				fmt.Printf("%s: %v escapes to heap:\n", pos, src.n)
+			}
+			explanation := e.explainFlow(pos, dst, src, k.derefs, k.notes, []*logopt.LoggedOpt{})
+			if logopt.Enabled() {
+				logopt.LogOpt(src.n.Pos, "escapes", "escape", e.curfn.funcname(), fmt.Sprintf("%v escapes to heap", src.n), explanation)
+			}
+
+		}
+		src.escapes = true
+		return
+	}
 
 	// TODO(mdempsky): Deduplicate edges?
-	dst.edges = append(dst.edges, EscEdge{src: src, derefs: k.derefs})
+	dst.edges = append(dst.edges, EscEdge{src: src, derefs: k.derefs, notes: k.notes})
 }
 
 func (e *Escape) heapHole() EscHole    { return e.heapLoc.asHole() }
@@ -1070,30 +1102,52 @@ func (e *Escape) discardHole() EscHole { return e.blankLoc.asHole() }
 // walkAll computes the minimal dereferences between all pairs of
 // locations.
 func (e *Escape) walkAll() {
-	var walkgen uint32
+	// We use a work queue to keep track of locations that we need
+	// to visit, and repeatedly walk until we reach a fixed point.
+	//
+	// We walk once from each location (including the heap), and
+	// then re-enqueue each location on its transition from
+	// transient->!transient and !escapes->escapes, which can each
+	// happen at most once. So we take Θ(len(e.allLocs)) walks.
 
-	for _, loc := range e.allLocs {
-		walkgen++
-		e.walkOne(loc, walkgen)
+	// LIFO queue, has enough room for e.allLocs and e.heapLoc.
+	todo := make([]*EscLocation, 0, len(e.allLocs)+1)
+	enqueue := func(loc *EscLocation) {
+		if !loc.queued {
+			todo = append(todo, loc)
+			loc.queued = true
+		}
 	}
 
-	// Walk the heap last so that we catch any edges to the heap
-	// added during walkOne.
-	walkgen++
-	e.walkOne(&e.heapLoc, walkgen)
+	for _, loc := range e.allLocs {
+		enqueue(loc)
+	}
+	enqueue(&e.heapLoc)
+
+	var walkgen uint32
+	for len(todo) > 0 {
+		root := todo[len(todo)-1]
+		todo = todo[:len(todo)-1]
+		root.queued = false
+
+		walkgen++
+		e.walkOne(root, walkgen, enqueue)
+	}
 }
 
 // walkOne computes the minimal number of dereferences from root to
 // all other locations.
-func (e *Escape) walkOne(root *EscLocation, walkgen uint32) {
+func (e *Escape) walkOne(root *EscLocation, walkgen uint32, enqueue func(*EscLocation)) {
 	// The data flow graph has negative edges (from addressing
 	// operations), so we use the Bellman-Ford algorithm. However,
 	// we don't have to worry about infinite negative cycles since
 	// we bound intermediate dereference counts to 0.
+
 	root.walkgen = walkgen
 	root.derefs = 0
+	root.dst = nil
 
-	todo := []*EscLocation{root}
+	todo := []*EscLocation{root} // LIFO queue
 	for len(todo) > 0 {
 		l := todo[len(todo)-1]
 		todo = todo[:len(todo)-1]
@@ -1112,54 +1166,150 @@ func (e *Escape) walkOne(root *EscLocation, walkgen uint32) {
 			// If l's address flows to a non-transient
 			// location, then l can't be transiently
 			// allocated.
-			if !root.transient {
+			if !root.transient && l.transient {
 				l.transient = false
-				// TODO(mdempsky): Should we re-walk from l now?
+				enqueue(l)
 			}
 		}
 
 		if e.outlives(root, l) {
-			// If l's address flows somewhere that
-			// outlives it, then l needs to be heap
-			// allocated.
-			if addressOf && !l.escapes {
-				l.escapes = true
-
-				// If l is heap allocated, then any
-				// values stored into it flow to the
-				// heap too.
-				// TODO(mdempsky): Better way to handle this?
-				if root != &e.heapLoc {
-					e.flow(e.heapHole(), l)
-				}
-			}
-
 			// l's value flows to root. If l is a function
 			// parameter and root is the heap or a
 			// corresponding result parameter, then record
 			// that value flow for tagging the function
 			// later.
 			if l.isName(PPARAM) {
+				if (logopt.Enabled() || Debug['m'] >= 2) && !l.escapes {
+					if Debug['m'] >= 2 {
+						fmt.Printf("%s: parameter %v leaks to %s with derefs=%d:\n", linestr(l.n.Pos), l.n, e.explainLoc(root), base)
+					}
+					explanation := e.explainPath(root, l)
+					if logopt.Enabled() {
+						logopt.LogOpt(l.n.Pos, "leak", "escape", e.curfn.funcname(),
+							fmt.Sprintf("parameter %v leaks to %s with derefs=%d", l.n, e.explainLoc(root), base), explanation)
+					}
+				}
 				l.leakTo(root, base)
+			}
+
+			// If l's address flows somewhere that
+			// outlives it, then l needs to be heap
+			// allocated.
+			if addressOf && !l.escapes {
+				if logopt.Enabled() || Debug['m'] >= 2 {
+					if Debug['m'] >= 2 {
+						fmt.Printf("%s: %v escapes to heap:\n", linestr(l.n.Pos), l.n)
+					}
+					explanation := e.explainPath(root, l)
+					if logopt.Enabled() {
+						logopt.LogOpt(l.n.Pos, "escape", "escape", e.curfn.funcname(), fmt.Sprintf("%v escapes to heap", l.n), explanation)
+					}
+				}
+				l.escapes = true
+				enqueue(l)
+				continue
 			}
 		}
 
-		for _, edge := range l.edges {
+		for i, edge := range l.edges {
+			if edge.src.escapes {
+				continue
+			}
 			derefs := base + edge.derefs
 			if edge.src.walkgen != walkgen || edge.src.derefs > derefs {
 				edge.src.walkgen = walkgen
 				edge.src.derefs = derefs
+				edge.src.dst = l
+				edge.src.dstEdgeIdx = i
 				todo = append(todo, edge.src)
 			}
 		}
 	}
 }
 
+// explainPath prints an explanation of how src flows to the walk root.
+func (e *Escape) explainPath(root, src *EscLocation) []*logopt.LoggedOpt {
+	visited := make(map[*EscLocation]bool)
+	pos := linestr(src.n.Pos)
+	var explanation []*logopt.LoggedOpt
+	for {
+		// Prevent infinite loop.
+		if visited[src] {
+			if Debug['m'] >= 2 {
+				fmt.Printf("%s:   warning: truncated explanation due to assignment cycle; see golang.org/issue/35518\n", pos)
+			}
+			break
+		}
+		visited[src] = true
+		dst := src.dst
+		edge := &dst.edges[src.dstEdgeIdx]
+		if edge.src != src {
+			Fatalf("path inconsistency: %v != %v", edge.src, src)
+		}
+
+		explanation = e.explainFlow(pos, dst, src, edge.derefs, edge.notes, explanation)
+
+		if dst == root {
+			break
+		}
+		src = dst
+	}
+
+	return explanation
+}
+
+func (e *Escape) explainFlow(pos string, dst, srcloc *EscLocation, derefs int, notes *EscNote, explanation []*logopt.LoggedOpt) []*logopt.LoggedOpt {
+	ops := "&"
+	if derefs >= 0 {
+		ops = strings.Repeat("*", derefs)
+	}
+	print := Debug['m'] >= 2
+
+	flow := fmt.Sprintf("   flow: %s = %s%v:", e.explainLoc(dst), ops, e.explainLoc(srcloc))
+	if print {
+		fmt.Printf("%s:%s\n", pos, flow)
+	}
+	if logopt.Enabled() {
+		var epos src.XPos
+		if notes != nil {
+			epos = notes.where.Pos
+		} else if srcloc != nil && srcloc.n != nil {
+			epos = srcloc.n.Pos
+		}
+		explanation = append(explanation, logopt.NewLoggedOpt(epos, "escflow", "escape", e.curfn.funcname(), flow))
+	}
+
+	for note := notes; note != nil; note = note.next {
+		if print {
+			fmt.Printf("%s:     from %v (%v) at %s\n", pos, note.where, note.why, linestr(note.where.Pos))
+		}
+		if logopt.Enabled() {
+			explanation = append(explanation, logopt.NewLoggedOpt(note.where.Pos, "escflow", "escape", e.curfn.funcname(),
+				fmt.Sprintf("     from %v (%v)", note.where, note.why)))
+		}
+	}
+	return explanation
+}
+
+func (e *Escape) explainLoc(l *EscLocation) string {
+	if l == &e.heapLoc {
+		return "{heap}"
+	}
+	if l.n == nil {
+		// TODO(mdempsky): Omit entirely.
+		return "{temp}"
+	}
+	if l.n.Op == ONAME {
+		return fmt.Sprintf("%v", l.n)
+	}
+	return fmt.Sprintf("{storage for %v}", l.n)
+}
+
 // outlives reports whether values stored in l may survive beyond
 // other's lifetime if stack allocated.
 func (e *Escape) outlives(l, other *EscLocation) bool {
 	// The heap outlives everything.
-	if l == &e.heapLoc {
+	if l.escapes {
 		return true
 	}
 
@@ -1226,34 +1376,36 @@ func containsClosure(f, c *Node) bool {
 
 // leak records that parameter l leaks to sink.
 func (l *EscLocation) leakTo(sink *EscLocation, derefs int) {
-	// Short circuit if l already leaks to heap.
-	if l.paramEsc == EscHeap {
-		return
-	}
-
 	// If sink is a result parameter and we can fit return bits
 	// into the escape analysis tag, then record a return leak.
 	if sink.isName(PPARAMOUT) && sink.curfn == l.curfn {
 		// TODO(mdempsky): Eliminate dependency on Vargen here.
 		ri := int(sink.n.Name.Vargen) - 1
-		if ri < numEscReturns {
+		if ri < numEscResults {
 			// Leak to result parameter.
-			if old := getEscReturn(l.paramEsc, ri); old < 0 || derefs < old {
-				l.paramEsc = setEscReturn(l.paramEsc, ri, derefs)
-			}
+			l.paramEsc.AddResult(ri, derefs)
 			return
 		}
 	}
 
 	// Otherwise, record as heap leak.
-	if derefs > 0 {
-		l.paramEsc |= EscContentEscapes
-	} else {
-		l.paramEsc = EscHeap
-	}
+	l.paramEsc.AddHeap(derefs)
 }
 
-func (e *Escape) finish() {
+func (e *Escape) finish(fns []*Node) {
+	// Record parameter tags for package export data.
+	for _, fn := range fns {
+		fn.Esc = EscFuncTagged
+
+		narg := 0
+		for _, fs := range &types.RecvsParams {
+			for _, f := range fs(fn.Type).Fields().Slice() {
+				narg++
+				f.Note = e.paramTag(fn, narg, f)
+			}
+		}
+	}
+
 	for _, loc := range e.allLocs {
 		n := loc.n
 		if n == nil {
@@ -1262,49 +1414,25 @@ func (e *Escape) finish() {
 		n.SetOpt(nil)
 
 		// Update n.Esc based on escape analysis results.
-		//
-		// TODO(mdempsky): Simplify once compatibility with
-		// esc.go is no longer necessary.
-		//
-		// TODO(mdempsky): Describe path when Debug['m'] >= 2.
 
 		if loc.escapes {
-			if Debug['m'] != 0 && n.Op != ONAME {
-				Warnl(n.Pos, "%S escapes to heap", n)
+			if n.Op != ONAME {
+				if Debug['m'] != 0 {
+					Warnl(n.Pos, "%S escapes to heap", n)
+				}
+				if logopt.Enabled() {
+					logopt.LogOpt(n.Pos, "escape", "escape", e.curfn.funcname())
+				}
 			}
 			n.Esc = EscHeap
 			addrescapes(n)
-		} else if loc.isName(PPARAM) {
-			n.Esc = finalizeEsc(loc.paramEsc)
-
-			if Debug['m'] != 0 && types.Haspointers(n.Type) {
-				if n.Esc == EscNone {
-					Warnl(n.Pos, "%S %S does not escape", funcSym(loc.curfn), n)
-				} else if n.Esc == EscHeap {
-					Warnl(n.Pos, "leaking param: %S", n)
-				} else {
-					if n.Esc&EscContentEscapes != 0 {
-						Warnl(n.Pos, "leaking param content: %S", n)
-					}
-					for i := 0; i < numEscReturns; i++ {
-						if x := getEscReturn(n.Esc, i); x >= 0 {
-							res := n.Name.Curfn.Type.Results().Field(i).Sym
-							Warnl(n.Pos, "leaking param: %S to result %v level=%d", n, res, x)
-						}
-					}
-				}
-			}
 		} else {
+			if Debug['m'] != 0 && n.Op != ONAME {
+				Warnl(n.Pos, "%S does not escape", n)
+			}
 			n.Esc = EscNone
 			if loc.transient {
-				switch n.Op {
-				case OCALLPART, OCLOSURE, ODDDARG, OARRAYLIT, OSLICELIT, OPTRLIT, OSTRUCTLIT:
-					n.SetNoescape(true)
-				}
-			}
-
-			if Debug['m'] != 0 && n.Op != ONAME && n.Op != OTYPESW && n.Op != ORANGE && n.Op != ODEFER {
-				Warnl(n.Pos, "%S %S does not escape", funcSym(loc.curfn), n)
+				n.SetTransient(true)
 			}
 		}
 	}
@@ -1314,73 +1442,97 @@ func (l *EscLocation) isName(c Class) bool {
 	return l.n != nil && l.n.Op == ONAME && l.n.Class() == c
 }
 
-func finalizeEsc(esc uint16) uint16 {
-	esc = optimizeReturns(esc)
+const numEscResults = 7
 
-	if esc>>EscReturnBits != 0 {
-		esc |= EscReturn
-	} else if esc&EscMask == 0 {
-		esc |= EscNone
+// An EscLeaks represents a set of assignment flows from a parameter
+// to the heap or to any of its function's (first numEscResults)
+// result parameters.
+type EscLeaks [1 + numEscResults]uint8
+
+// Empty reports whether l is an empty set (i.e., no assignment flows).
+func (l EscLeaks) Empty() bool { return l == EscLeaks{} }
+
+// Heap returns the minimum deref count of any assignment flow from l
+// to the heap. If no such flows exist, Heap returns -1.
+func (l EscLeaks) Heap() int { return l.get(0) }
+
+// Result returns the minimum deref count of any assignment flow from
+// l to its function's i'th result parameter. If no such flows exist,
+// Result returns -1.
+func (l EscLeaks) Result(i int) int { return l.get(1 + i) }
+
+// AddHeap adds an assignment flow from l to the heap.
+func (l *EscLeaks) AddHeap(derefs int) { l.add(0, derefs) }
+
+// AddResult adds an assignment flow from l to its function's i'th
+// result parameter.
+func (l *EscLeaks) AddResult(i, derefs int) { l.add(1+i, derefs) }
+
+func (l *EscLeaks) setResult(i, derefs int) { l.set(1+i, derefs) }
+
+func (l EscLeaks) get(i int) int { return int(l[i]) - 1 }
+
+func (l *EscLeaks) add(i, derefs int) {
+	if old := l.get(i); old < 0 || derefs < old {
+		l.set(i, derefs)
 	}
-
-	return esc
 }
 
-func optimizeReturns(esc uint16) uint16 {
-	if esc&EscContentEscapes != 0 {
-		// EscContentEscapes represents a path of length 1
-		// from the heap. No point in keeping paths of equal
-		// or longer length to result parameters.
-		for i := 0; i < numEscReturns; i++ {
-			if x := getEscReturn(esc, i); x >= 1 {
-				esc = setEscReturn(esc, i, -1)
+func (l *EscLeaks) set(i, derefs int) {
+	v := derefs + 1
+	if v < 0 {
+		Fatalf("invalid derefs count: %v", derefs)
+	}
+	if v > math.MaxUint8 {
+		v = math.MaxUint8
+	}
+
+	l[i] = uint8(v)
+}
+
+// Optimize removes result flow paths that are equal in length or
+// longer than the shortest heap flow path.
+func (l *EscLeaks) Optimize() {
+	// If we have a path to the heap, then there's no use in
+	// keeping equal or longer paths elsewhere.
+	if x := l.Heap(); x >= 0 {
+		for i := 0; i < numEscResults; i++ {
+			if l.Result(i) >= x {
+				l.setResult(i, -1)
 			}
 		}
 	}
-	return esc
 }
 
-// Parameter tags.
-//
-// The escape bits saved for each analyzed parameter record the
-// minimal derefs (if any) from that parameter to the heap, or to any
-// of its function's (first numEscReturns) result parameters.
-//
-// Paths to the heap are encoded via EscHeap (length 0) or
-// EscContentEscapes (length 1); if neither of these are set, then
-// there's no path to the heap.
-//
-// Paths to the result parameters are encoded in the upper
-// bits.
-//
-// There are other values stored in the escape bits by esc.go for
-// vestigial reasons, and other special tag values used (e.g.,
-// uintptrEscapesTag and unsafeUintptrTag). These could be simplified
-// once compatibility with esc.go is no longer a concern.
+var leakTagCache = map[EscLeaks]string{}
 
-const numEscReturns = (16 - EscReturnBits) / bitsPerOutputInTag
+// Encode converts l into a binary string for export data.
+func (l EscLeaks) Encode() string {
+	if l.Heap() == 0 {
+		// Space optimization: empty string encodes more
+		// efficiently in export data.
+		return ""
+	}
+	if s, ok := leakTagCache[l]; ok {
+		return s
+	}
 
-func getEscReturn(esc uint16, i int) int {
-	return int((esc>>escReturnShift(i))&bitsMaskForTag) - 1
+	n := len(l)
+	for n > 0 && l[n-1] == 0 {
+		n--
+	}
+	s := "esc:" + string(l[:n])
+	leakTagCache[l] = s
+	return s
 }
 
-func setEscReturn(esc uint16, i, v int) uint16 {
-	if v < -1 {
-		Fatalf("invalid esc return value: %v", v)
+// ParseLeaks parses a binary string representing an EscLeaks.
+func ParseLeaks(s string) EscLeaks {
+	var l EscLeaks
+	if !strings.HasPrefix(s, "esc:") {
+		l.AddHeap(0)
+		return l
 	}
-	if v > maxEncodedLevel {
-		v = maxEncodedLevel
-	}
-
-	shift := escReturnShift(i)
-	esc &^= bitsMaskForTag << shift
-	esc |= uint16(v+1) << shift
-	return esc
-}
-
-func escReturnShift(i int) uint {
-	if uint(i) >= numEscReturns {
-		Fatalf("esc return index out of bounds: %v", i)
-	}
-	return uint(EscReturnBits + i*bitsPerOutputInTag)
+	copy(l[:], s[4:])
+	return l
 }

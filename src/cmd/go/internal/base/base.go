@@ -7,11 +7,8 @@
 package base
 
 import (
-	"bytes"
-	"errors"
 	"flag"
 	"fmt"
-	"go/scanner"
 	"log"
 	"os"
 	"os/exec"
@@ -132,6 +129,10 @@ func SetExitStatus(n int) {
 	exitMu.Unlock()
 }
 
+func GetExitStatus() int {
+	return exitStatus
+}
+
 // Run runs the command, with stdout and stderr
 // connected to the go command's own stdout and stderr.
 // If the command fails, Run reports the error using Errorf.
@@ -168,25 +169,3 @@ func RunStdin(cmdline []string) {
 // Usage is the usage-reporting function, filled in by package main
 // but here for reference by other packages.
 var Usage func()
-
-// ExpandScanner expands a scanner.List error into all the errors in the list.
-// The default Error method only shows the first error
-// and does not shorten paths.
-func ExpandScanner(err error) error {
-	// Look for parser errors.
-	if err, ok := err.(scanner.ErrorList); ok {
-		// Prepare error with \n before each message.
-		// When printed in something like context: %v
-		// this will put the leading file positions each on
-		// its own line. It will also show all the errors
-		// instead of just the first, as err.Error does.
-		var buf bytes.Buffer
-		for _, e := range err {
-			e.Pos.Filename = ShortPath(e.Pos.Filename)
-			buf.WriteString("\n")
-			buf.WriteString(e.Error())
-		}
-		return errors.New(buf.String())
-	}
-	return err
-}

@@ -5,6 +5,7 @@
 package reflectlite
 
 import (
+	"internal/unsafeheader"
 	"runtime"
 	"unsafe"
 )
@@ -179,19 +180,6 @@ type emptyInterface struct {
 	word unsafe.Pointer
 }
 
-// nonEmptyInterface is the header for an interface value with methods.
-type nonEmptyInterface struct {
-	// see ../runtime/iface.go:/Itab
-	itab *struct {
-		ityp *rtype // static interface type
-		typ  *rtype // dynamic concrete type
-		hash uint32 // copy of typ.hash
-		_    [4]byte
-		fun  [100000]unsafe.Pointer // method table
-	}
-	word unsafe.Pointer
-}
-
 // mustBeExported panics if f records that the value was obtained using
 // an unexported field.
 func (f flag) mustBeExported() {
@@ -318,7 +306,7 @@ func (v Value) IsNil() bool {
 // IsValid reports whether v represents a value.
 // It returns false if v is the zero Value.
 // If IsValid returns false, all other methods except String panic.
-// Most functions and methods never return an invalid value.
+// Most functions and methods never return an invalid Value.
 // If one does, its documentation states the conditions explicitly.
 func (v Value) IsValid() bool {
 	return v.flag != 0
@@ -348,10 +336,10 @@ func (v Value) Len() int {
 		return maplen(v.pointer())
 	case Slice:
 		// Slice is bigger than a word; assume flagIndir.
-		return (*sliceHeader)(v.ptr).Len
+		return (*unsafeheader.Slice)(v.ptr).Len
 	case String:
 		// String is bigger than a word; assume flagIndir.
-		return (*stringHeader)(v.ptr).Len
+		return (*unsafeheader.String)(v.ptr).Len
 	}
 	panic(&ValueError{"reflect.Value.Len", v.kind()})
 }
@@ -390,19 +378,6 @@ func (v Value) Type() Type {
 	}
 	// Method values not supported.
 	return v.typ
-}
-
-// stringHeader is a safe version of StringHeader used within this package.
-type stringHeader struct {
-	Data unsafe.Pointer
-	Len  int
-}
-
-// sliceHeader is a safe version of SliceHeader used within this package.
-type sliceHeader struct {
-	Data unsafe.Pointer
-	Len  int
-	Cap  int
 }
 
 /*

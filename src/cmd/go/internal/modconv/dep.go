@@ -6,15 +6,15 @@ package modconv
 
 import (
 	"fmt"
+	"internal/lazyregexp"
 	"net/url"
 	"path"
-	"regexp"
 	"strconv"
 	"strings"
 
-	"cmd/go/internal/modfile"
-	"cmd/go/internal/module"
-	"cmd/go/internal/semver"
+	"golang.org/x/mod/modfile"
+	"golang.org/x/mod/module"
+	"golang.org/x/mod/semver"
 )
 
 func ParseGopkgLock(file string, data []byte) (*modfile.File, error) {
@@ -96,7 +96,7 @@ func ParseGopkgLock(file string, data []byte) (*modfile.File, error) {
 	return mf, nil
 }
 
-var scpSyntaxReg = regexp.MustCompile(`^([a-zA-Z0-9_]+)@([a-zA-Z0-9._-]+):(.*)$`)
+var scpSyntaxReg = lazyregexp.New(`^([a-zA-Z0-9_]+)@([a-zA-Z0-9._-]+):(.*)$`)
 
 func decodeSource(source string) (string, error) {
 	var u *url.URL

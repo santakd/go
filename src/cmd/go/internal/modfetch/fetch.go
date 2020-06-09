@@ -7,6 +7,7 @@ package modfetch
 import (
 	"archive/zip"
 	"bytes"
+	"errors"
 	"fmt"
 	"io"
 	"io/ioutil"
@@ -18,10 +19,14 @@ import (
 
 	"cmd/go/internal/base"
 	"cmd/go/internal/cfg"
-	"cmd/go/internal/dirhash"
-	"cmd/go/internal/module"
+	"cmd/go/internal/lockedfile"
 	"cmd/go/internal/par"
 	"cmd/go/internal/renameio"
+	"cmd/go/internal/robustio"
+
+	"golang.org/x/mod/module"
+	"golang.org/x/mod/sumdb/dirhash"
+	modzip "golang.org/x/mod/zip"
 )
 
 var downloadCache par.Cache
@@ -30,9 +35,10 @@ var downloadCache par.Cache
 // local download cache and returns the name of the directory
 // corresponding to the root of the module's file tree.
 func Download(mod module.Version) (dir string, err error) {
-	if PkgMod == "" {
-		// Do not download to current directory.
-		return "", fmt.Errorf("missing modfetch.PkgMod")
+	if cfg.GOMODCACHE == "" {
+		// modload.Init exits if GOPATH[0] is empty, and cfg.GOMODCACHE
+		// is set to GOPATH[0]/pkg/mod if GOMODCACHE is empty, so this should never happen.
+		base.Fatalf("go: internal error: cfg.GOMODCACHE not set")
 	}
 
 	// The par.Cache here avoids duplicate work.
@@ -41,11 +47,8 @@ func Download(mod module.Version) (dir string, err error) {
 		err error
 	}
 	c := downloadCache.Do(mod, func() interface{} {
-		dir, err := DownloadDir(mod)
+		dir, err := download(mod)
 		if err != nil {
-			return cached{"", err}
-		}
-		if err := download(mod, dir); err != nil {
 			return cached{"", err}
 		}
 		checkMod(mod)
@@ -54,11 +57,16 @@ func Download(mod module.Version) (dir string, err error) {
 	return c.dir, c.err
 }
 
-func download(mod module.Version, dir string) (err error) {
-	// If the directory exists, the module has already been extracted.
-	fi, err := os.Stat(dir)
-	if err == nil && fi.IsDir() {
-		return nil
+func download(mod module.Version) (dir string, err error) {
+	// If the directory exists, and no .partial file exists, the module has
+	// already been completely extracted. .partial files may be created when a
+	// module zip directory is extracted in place instead of being extracted to a
+	// temporary directory and renamed.
+	dir, err = DownloadDir(mod)
+	if err == nil {
+		return dir, nil
+	} else if dir == "" || !errors.Is(err, os.ErrNotExist) {
+		return "", err
 	}
 
 	// To avoid cluttering the cache with extraneous files,
@@ -66,26 +74,24 @@ func download(mod module.Version, dir string) (err error) {
 	// Invoke DownloadZip before locking the file.
 	zipfile, err := DownloadZip(mod)
 	if err != nil {
-		return err
-	}
-
-	if cfg.CmdName != "mod download" {
-		fmt.Fprintf(os.Stderr, "go: extracting %s %s\n", mod.Path, mod.Version)
+		return "", err
 	}
 
 	unlock, err := lockVersion(mod)
 	if err != nil {
-		return err
+		return "", err
 	}
 	defer unlock()
 
 	// Check whether the directory was populated while we were waiting on the lock.
-	fi, err = os.Stat(dir)
-	if err == nil && fi.IsDir() {
-		return nil
+	_, dirErr := DownloadDir(mod)
+	if dirErr == nil {
+		return dir, nil
 	}
+	_, dirExists := dirErr.(*DownloadDirPartialError)
 
-	// Clean up any remaining temporary directories from previous runs.
+	// Clean up any remaining temporary directories from previous runs, as well
+	// as partially extracted diectories created by future versions of cmd/go.
 	// This is only safe to do because the lock file ensures that their writers
 	// are no longer active.
 	parentDir := filepath.Dir(dir)
@@ -95,39 +101,94 @@ func download(mod module.Version, dir string) (err error) {
 			RemoveAll(path) // best effort
 		}
 	}
-
-	// Extract the zip file to a temporary directory, then rename it to the
-	// final path. That way, we can use the existence of the source directory to
-	// signal that it has been extracted successfully, and if someone deletes
-	// the entire directory (e.g. as an attempt to prune out file corruption)
-	// the module cache will still be left in a recoverable state.
-	if err := os.MkdirAll(parentDir, 0777); err != nil {
-		return err
-	}
-	tmpDir, err := ioutil.TempDir(parentDir, tmpPrefix)
-	if err != nil {
-		return err
-	}
-	defer func() {
-		if err != nil {
-			RemoveAll(tmpDir)
+	if dirExists {
+		if err := RemoveAll(dir); err != nil {
+			return "", err
 		}
-	}()
-
-	modpath := mod.Path + "@" + mod.Version
-	if err := Unzip(tmpDir, zipfile, modpath, 0); err != nil {
-		fmt.Fprintf(os.Stderr, "-> %s\n", err)
-		return err
 	}
 
-	if err := os.Rename(tmpDir, dir); err != nil {
-		return err
+	partialPath, err := CachePath(mod, "partial")
+	if err != nil {
+		return "", err
+	}
+	if err := os.Remove(partialPath); err != nil && !os.IsNotExist(err) {
+		return "", err
 	}
 
-	// Make dir read-only only *after* renaming it.
-	// os.Rename was observed to fail for read-only directories on macOS.
-	makeDirsReadOnly(dir)
-	return nil
+	// Extract the module zip directory.
+	//
+	// By default, we extract to a temporary directory, then atomically rename to
+	// its final location. We use the existence of the source directory to signal
+	// that it has been extracted successfully (see DownloadDir).  If someone
+	// deletes the entire directory (e.g., as an attempt to prune out file
+	// corruption), the module cache will still be left in a recoverable
+	// state.
+	//
+	// Unfortunately, os.Rename may fail with ERROR_ACCESS_DENIED on Windows if
+	// another process opens files in the temporary directory. This is partially
+	// mitigated by using robustio.Rename, which retries os.Rename for a short
+	// time.
+	//
+	// To avoid this error completely, if unzipInPlace is set, we instead create a
+	// .partial file (indicating the directory isn't fully extracted), then we
+	// extract the directory at its final location, then we delete the .partial
+	// file. This is not the default behavior because older versions of Go may
+	// simply stat the directory to check whether it exists without looking for a
+	// .partial file. If multiple versions run concurrently, the older version may
+	// assume a partially extracted directory is complete.
+	// TODO(golang.org/issue/36568): when these older versions are no longer
+	// supported, remove the old default behavior and the unzipInPlace flag.
+	if err := os.MkdirAll(parentDir, 0777); err != nil {
+		return "", err
+	}
+
+	if unzipInPlace {
+		if err := ioutil.WriteFile(partialPath, nil, 0666); err != nil {
+			return "", err
+		}
+		if err := modzip.Unzip(dir, mod, zipfile); err != nil {
+			fmt.Fprintf(os.Stderr, "-> %s\n", err)
+			if rmErr := RemoveAll(dir); rmErr == nil {
+				os.Remove(partialPath)
+			}
+			return "", err
+		}
+		if err := os.Remove(partialPath); err != nil {
+			return "", err
+		}
+	} else {
+		tmpDir, err := ioutil.TempDir(parentDir, tmpPrefix)
+		if err != nil {
+			return "", err
+		}
+		if err := modzip.Unzip(tmpDir, mod, zipfile); err != nil {
+			fmt.Fprintf(os.Stderr, "-> %s\n", err)
+			RemoveAll(tmpDir)
+			return "", err
+		}
+		if err := robustio.Rename(tmpDir, dir); err != nil {
+			RemoveAll(tmpDir)
+			return "", err
+		}
+	}
+
+	if !cfg.ModCacheRW {
+		// Make dir read-only only *after* renaming it.
+		// os.Rename was observed to fail for read-only directories on macOS.
+		makeDirsReadOnly(dir)
+	}
+	return dir, nil
+}
+
+var unzipInPlace bool
+
+func init() {
+	for _, f := range strings.Split(os.Getenv("GODEBUG"), ",") {
+		if f == "modcacheunzipinplace=1" {
+			unzipInPlace = true
+			break
+		}
+	}
 }
 
 var downloadZipCache par.Cache
@@ -205,11 +266,14 @@ func downloadZip(mod module.Version, zipfile string) (err error) {
 		}
 	}()
 
-	repo, err := Lookup(mod.Path)
+	err = TryProxies(func(proxy string) error {
+		repo, err := Lookup(proxy, mod.Path)
+		if err != nil {
+			return err
+		}
+		return repo.Zip(f, mod.Version)
+	})
 	if err != nil {
-		return err
-	}
-	if err := repo.Zip(f, mod.Version); err != nil {
 		return err
 	}
 
@@ -246,9 +310,11 @@ func downloadZip(mod module.Version, zipfile string) (err error) {
 	if err != nil {
 		return err
 	}
-	checkModSum(mod, hash)
+	if err := checkModSum(mod, hash); err != nil {
+		return err
+	}
 
-	if err := renameio.WriteFile(zipfile+"hash", []byte(hash)); err != nil {
+	if err := renameio.WriteFile(zipfile+"hash", []byte(hash), 0666); err != nil {
 		return err
 	}
 	if err := os.Rename(f.Name(), zipfile); err != nil {
@@ -258,6 +324,45 @@ func downloadZip(mod module.Version, zipfile string) (err error) {
 	// TODO(bcmills): Should we make the .zip and .ziphash files read-only to discourage tampering?
 
 	return nil
+}
+
+// makeDirsReadOnly makes a best-effort attempt to remove write permissions for dir
+// and its transitive contents.
+func makeDirsReadOnly(dir string) {
+	type pathMode struct {
+		path string
+		mode os.FileMode
+	}
+	var dirs []pathMode // in lexical order
+	filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
+		if err == nil && info.Mode()&0222 != 0 {
+			if info.IsDir() {
+				dirs = append(dirs, pathMode{path, info.Mode()})
+			}
+		}
+		return nil
+	})
+
+	// Run over list backward to chmod children before parents.
+	for i := len(dirs) - 1; i >= 0; i-- {
+		os.Chmod(dirs[i].path, dirs[i].mode&^0222)
+	}
+}
+
+// RemoveAll removes a directory written by Download or Unzip, first applying
+// any permission changes needed to do so.
+func RemoveAll(dir string) error {
+	// Module cache has 0555 directories; make them writable in order to remove content.
+	filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return nil // ignore errors walking in file system
+		}
+		if info.IsDir() {
+			os.Chmod(path, 0777)
+		}
+		return nil
+	})
+	return robustio.RemoveAll(dir)
 }
 
 var GoSumFile string // path to go.sum; set by package modload
@@ -278,21 +383,22 @@ var goSum struct {
 }
 
 // initGoSum initializes the go.sum data.
-// It reports whether use of go.sum is now enabled.
+// The boolean it returns reports whether the
+// use of go.sum is now enabled.
 // The goSum lock must be held.
-func initGoSum() bool {
+func initGoSum() (bool, error) {
 	if GoSumFile == "" {
-		return false
+		return false, nil
 	}
 	if goSum.m != nil {
-		return true
+		return true, nil
 	}
 
 	goSum.m = make(map[module.Version][]string)
 	goSum.checked = make(map[modSum]bool)
-	data, err := ioutil.ReadFile(GoSumFile)
+	data, err := lockedfile.Read(GoSumFile)
 	if err != nil && !os.IsNotExist(err) {
-		base.Fatalf("go: %v", err)
+		return false, err
 	}
 	goSum.enabled = true
 	readGoSum(goSum.m, GoSumFile, data)
@@ -300,7 +406,7 @@ func initGoSum() bool {
 	// Add old go.modverify file.
 	// We'll delete go.modverify in WriteGoSum.
 	alt := strings.TrimSuffix(GoSumFile, ".sum") + ".modverify"
-	if data, err := ioutil.ReadFile(alt); err == nil {
+	if data, err := renameio.ReadFile(alt); err == nil {
 		migrate := make(map[module.Version][]string)
 		readGoSum(migrate, alt, data)
 		for mod, sums := range migrate {
@@ -310,7 +416,7 @@ func initGoSum() bool {
 		}
 		goSum.modverify = alt
 	}
-	return true
+	return true, nil
 }
 
 // emptyGoModHash is the hash of a 1-file tree containing a 0-length go.mod.
@@ -320,7 +426,7 @@ const emptyGoModHash = "h1:G7mAYYxgmS0lVkHyy2hEOLQCFB0DlQFTMLWggykrydY="
 
 // readGoSum parses data, which is the content of file,
 // and adds it to goSum.m. The goSum lock must be held.
-func readGoSum(dst map[module.Version][]string, file string, data []byte) {
+func readGoSum(dst map[module.Version][]string, file string, data []byte) error {
 	lineno := 0
 	for len(data) > 0 {
 		var line []byte
@@ -337,7 +443,7 @@ func readGoSum(dst map[module.Version][]string, file string, data []byte) {
 			continue
 		}
 		if len(f) != 3 {
-			base.Fatalf("go: malformed go.sum:\n%s:%d: wrong number of fields %v", file, lineno, len(f))
+			return fmt.Errorf("malformed go.sum:\n%s:%d: wrong number of fields %v", file, lineno, len(f))
 		}
 		if f[2] == emptyGoModHash {
 			// Old bug; drop it.
@@ -346,11 +452,12 @@ func readGoSum(dst map[module.Version][]string, file string, data []byte) {
 		mod := module.Version{Path: f[0], Version: f[1]}
 		dst[mod] = append(dst[mod], f[2])
 	}
+	return nil
 }
 
 // checkMod checks the given module's checksum.
 func checkMod(mod module.Version) {
-	if PkgMod == "" {
+	if cfg.GOMODCACHE == "" {
 		// Do not use current directory.
 		return
 	}
@@ -358,22 +465,24 @@ func checkMod(mod module.Version) {
 	// Do the file I/O before acquiring the go.sum lock.
 	ziphash, err := CachePath(mod, "ziphash")
 	if err != nil {
-		base.Fatalf("verifying %s@%s: %v", mod.Path, mod.Version, err)
+		base.Fatalf("verifying %v", module.VersionError(mod, err))
 	}
-	data, err := ioutil.ReadFile(ziphash)
+	data, err := renameio.ReadFile(ziphash)
 	if err != nil {
-		if os.IsNotExist(err) {
+		if errors.Is(err, os.ErrNotExist) {
 			// This can happen if someone does rm -rf GOPATH/src/cache/download. So it goes.
 			return
 		}
-		base.Fatalf("verifying %s@%s: %v", mod.Path, mod.Version, err)
+		base.Fatalf("verifying %v", module.VersionError(mod, err))
 	}
 	h := strings.TrimSpace(string(data))
 	if !strings.HasPrefix(h, "h1:") {
-		base.Fatalf("verifying %s@%s: unexpected ziphash: %q", mod.Path, mod.Version, h)
+		base.Fatalf("verifying %v", module.VersionError(mod, fmt.Errorf("unexpected ziphash: %q", h)))
 	}
 
-	checkModSum(mod, h)
+	if err := checkModSum(mod, h); err != nil {
+		base.Fatalf("%s", err)
+	}
 }
 
 // goModSum returns the checksum for the go.mod contents.
@@ -385,17 +494,17 @@ func goModSum(data []byte) (string, error) {
 
 // checkGoMod checks the given module's go.mod checksum;
 // data is the go.mod content.
-func checkGoMod(path, version string, data []byte) {
+func checkGoMod(path, version string, data []byte) error {
 	h, err := goModSum(data)
 	if err != nil {
-		base.Fatalf("verifying %s %s go.mod: %v", path, version, err)
+		return &module.ModuleError{Path: path, Version: version, Err: fmt.Errorf("verifying go.mod: %v", err)}
 	}
 
-	checkModSum(module.Version{Path: path, Version: version + "/go.mod"}, h)
+	return checkModSum(module.Version{Path: path, Version: version + "/go.mod"}, h)
 }
 
 // checkModSum checks that the recorded checksum for mod is h.
-func checkModSum(mod module.Version, h string) {
+func checkModSum(mod module.Version, h string) error {
 	// We lock goSum when manipulating it,
 	// but we arrange to release the lock when calling checkSumDB,
 	// so that parallel calls to checkModHash can execute parallel calls
@@ -403,19 +512,25 @@ func checkModSum(mod module.Version, h string) {
 
 	// Check whether mod+h is listed in go.sum already. If so, we're done.
 	goSum.mu.Lock()
-	inited := initGoSum()
+	inited, err := initGoSum()
+	if err != nil {
+		goSum.mu.Unlock()
+		return err
+	}
 	done := inited && haveModSumLocked(mod, h)
 	goSum.mu.Unlock()
 
 	if done {
-		return
+		return nil
 	}
 
 	// Not listed, so we want to add them.
 	// Consult checksum database if appropriate.
 	if useSumDB(mod) {
 		// Calls base.Fatalf if mismatch detected.
-		checkSumDB(mod, h)
+		if err := checkSumDB(mod, h); err != nil {
+			return err
+		}
 	}
 
 	// Add mod+h to go.sum, if it hasn't appeared already.
@@ -424,6 +539,7 @@ func checkModSum(mod module.Version, h string) {
 		addModSumLocked(mod, h)
 		goSum.mu.Unlock()
 	}
+	return nil
 }
 
 // haveModSumLocked reports whether the pair mod,h is already listed in go.sum.
@@ -457,28 +573,29 @@ func addModSumLocked(mod module.Version, h string) {
 
 // checkSumDB checks the mod, h pair against the Go checksum database.
 // It calls base.Fatalf if the hash is to be rejected.
-func checkSumDB(mod module.Version, h string) {
+func checkSumDB(mod module.Version, h string) error {
 	db, lines, err := lookupSumDB(mod)
 	if err != nil {
-		base.Fatalf("verifying %s@%s: %v", mod.Path, mod.Version, err)
+		return module.VersionError(mod, fmt.Errorf("verifying module: %v", err))
 	}
 
 	have := mod.Path + " " + mod.Version + " " + h
 	prefix := mod.Path + " " + mod.Version + " h1:"
 	for _, line := range lines {
 		if line == have {
-			return
+			return nil
 		}
 		if strings.HasPrefix(line, prefix) {
-			base.Fatalf("verifying %s@%s: checksum mismatch\n\tdownloaded: %v\n\t%s: %v"+sumdbMismatch, mod.Path, mod.Version, h, db, line[len(prefix)-len("h1:"):])
+			return module.VersionError(mod, fmt.Errorf("verifying module: checksum mismatch\n\tdownloaded: %v\n\t%s: %v"+sumdbMismatch, h, db, line[len(prefix)-len("h1:"):]))
 		}
 	}
+	return nil
 }
 
 // Sum returns the checksum for the downloaded copy of the given module,
 // if present in the download cache.
 func Sum(mod module.Version) string {
-	if PkgMod == "" {
+	if cfg.GOMODCACHE == "" {
 		// Do not use current directory.
 		return ""
 	}
@@ -487,7 +604,7 @@ func Sum(mod module.Version) string {
 	if err != nil {
 		return ""
 	}
-	data, err := ioutil.ReadFile(ziphash)
+	data, err := renameio.ReadFile(ziphash)
 	if err != nil {
 		return ""
 	}
@@ -509,61 +626,49 @@ func WriteGoSum() {
 		// Don't bother opening the go.sum file if we don't have anything to add.
 		return
 	}
-
-	// We want to avoid races between creating the lockfile and deleting it, but
-	// we also don't want to leave a permanent lockfile in the user's repository.
-	//
-	// On top of that, if we crash while writing go.sum, we don't want to lose the
-	// sums that were already present in the file, so it's important that we write
-	// the file by renaming rather than truncating — which means that we can't
-	// lock the go.sum file itself.
-	//
-	// Instead, we'll lock a distinguished file in the cache directory: that will
-	// only race if the user runs `go clean -modcache` concurrently with a command
-	// that updates go.sum, and that's already racy to begin with.
-	//
-	// We'll end up slightly over-synchronizing go.sum writes if the user runs a
-	// bunch of go commands that update sums in separate modules simultaneously,
-	// but that's unlikely to matter in practice.
-
-	unlock := SideLock()
-	defer unlock()
-
-	if !goSum.overwrite {
-		// Re-read the go.sum file to incorporate any sums added by other processes
-		// in the meantime.
-		data, err := ioutil.ReadFile(GoSumFile)
-		if err != nil && !os.IsNotExist(err) {
-			base.Fatalf("go: re-reading go.sum: %v", err)
-		}
-
-		// Add only the sums that we actually checked: the user may have edited or
-		// truncated the file to remove erroneous hashes, and we shouldn't restore
-		// them without good reason.
-		goSum.m = make(map[module.Version][]string, len(goSum.m))
-		readGoSum(goSum.m, GoSumFile, data)
-		for ms := range goSum.checked {
-			addModSumLocked(ms.mod, ms.sum)
-			goSum.dirty = true
-		}
+	if cfg.BuildMod == "readonly" {
+		base.Fatalf("go: updates to go.sum needed, disabled by -mod=readonly")
 	}
 
-	var mods []module.Version
-	for m := range goSum.m {
-		mods = append(mods, m)
-	}
-	module.Sort(mods)
-	var buf bytes.Buffer
-	for _, m := range mods {
-		list := goSum.m[m]
-		sort.Strings(list)
-		for _, h := range list {
-			fmt.Fprintf(&buf, "%s %s %s\n", m.Path, m.Version, h)
-		}
+	// Make a best-effort attempt to acquire the side lock, only to exclude
+	// previous versions of the 'go' command from making simultaneous edits.
+	if unlock, err := SideLock(); err == nil {
+		defer unlock()
 	}
 
-	if err := renameio.WriteFile(GoSumFile, buf.Bytes()); err != nil {
-		base.Fatalf("go: writing go.sum: %v", err)
+	err := lockedfile.Transform(GoSumFile, func(data []byte) ([]byte, error) {
+		if !goSum.overwrite {
+			// Incorporate any sums added by other processes in the meantime.
+			// Add only the sums that we actually checked: the user may have edited or
+			// truncated the file to remove erroneous hashes, and we shouldn't restore
+			// them without good reason.
+			goSum.m = make(map[module.Version][]string, len(goSum.m))
+			readGoSum(goSum.m, GoSumFile, data)
+			for ms := range goSum.checked {
+				addModSumLocked(ms.mod, ms.sum)
+				goSum.dirty = true
+			}
+		}
+
+		var mods []module.Version
+		for m := range goSum.m {
+			mods = append(mods, m)
+		}
+		module.Sort(mods)
+
+		var buf bytes.Buffer
+		for _, m := range mods {
+			list := goSum.m[m]
+			sort.Strings(list)
+			for _, h := range list {
+				fmt.Fprintf(&buf, "%s %s %s\n", m.Path, m.Version, h)
+			}
+		}
+		return buf.Bytes(), nil
+	})
+
+	if err != nil {
+		base.Fatalf("go: updating go.sum: %v", err)
 	}
 
 	goSum.checked = make(map[modSum]bool)
@@ -579,7 +684,11 @@ func WriteGoSum() {
 func TrimGoSum(keep map[module.Version]bool) {
 	goSum.mu.Lock()
 	defer goSum.mu.Unlock()
-	if !initGoSum() {
+	inited, err := initGoSum()
+	if err != nil {
+		base.Fatalf("%s", err)
+	}
+	if !inited {
 		return
 	}
 
@@ -625,7 +734,7 @@ For more information, see 'go help module-auth'.
 
 `
 
-var HelpSum = &base.Command{
+var HelpModuleAuth = &base.Command{
 	UsageLine: "module-auth",
 	Short:     "module authentication using go.sum",
 	Long: `
@@ -695,29 +804,71 @@ to use and optionally its public key and URL, as in:
 	GOSUMDB="sum.golang.org+<publickey>"
 	GOSUMDB="sum.golang.org+<publickey> https://sum.golang.org"
 
-The go command knows the public key of sum.golang.org; use of any other
-database requires giving the public key explicitly. The URL defaults to
-"https://" followed by the database name.
+The go command knows the public key of sum.golang.org, and also that the name
+sum.golang.google.cn (available inside mainland China) connects to the
+sum.golang.org checksum database; use of any other database requires giving
+the public key explicitly.
+The URL defaults to "https://" followed by the database name.
 
-GOSUMDB defaults to "sum.golang.org" when GOPROXY="https://proxy.golang.org"
-and otherwise defaults to "off". NOTE: The GOSUMDB will later default to
-"sum.golang.org" unconditionally.
+GOSUMDB defaults to "sum.golang.org", the Go checksum database run by Google.
+See https://sum.golang.org/privacy for the service's privacy policy.
 
 If GOSUMDB is set to "off", or if "go get" is invoked with the -insecure flag,
-the checksum database is never consulted, but at the cost of giving up the
-security guarantee of verified repeatable downloads for all modules.
-A better way to bypass the checksum database for specific modules is
-to use the GONOSUMDB environment variable.
+the checksum database is not consulted, and all unrecognized modules are
+accepted, at the cost of giving up the security guarantee of verified repeatable
+downloads for all modules. A better way to bypass the checksum database
+for specific modules is to use the GOPRIVATE or GONOSUMDB environment
+variables. See 'go help module-private' for details.
 
-The GONOSUMDB environment variable is a comma-separated list of
-patterns (in the syntax of Go's path.Match) of module path prefixes
-that should not be compared against the checksum database.
+The 'go env -w' command (see 'go help env') can be used to set these variables
+for future go command invocations.
+`,
+}
+
+var HelpModulePrivate = &base.Command{
+	UsageLine: "module-private",
+	Short:     "module configuration for non-public modules",
+	Long: `
+The go command defaults to downloading modules from the public Go module
+mirror at proxy.golang.org. It also defaults to validating downloaded modules,
+regardless of source, against the public Go checksum database at sum.golang.org.
+These defaults work well for publicly available source code.
+
+The GOPRIVATE environment variable controls which modules the go command
+considers to be private (not available publicly) and should therefore not use the
+proxy or checksum database. The variable is a comma-separated list of
+glob patterns (in the syntax of Go's path.Match) of module path prefixes.
 For example,
 
-	GONOSUMDB=*.corp.example.com,rsc.io/private
+	GOPRIVATE=*.corp.example.com,rsc.io/private
 
-disables checksum database lookups for modules with path prefixes matching
-either pattern, including "git.corp.example.com/xyzzy", "rsc.io/private",
-and "rsc.io/private/quux".
+causes the go command to treat as private any module with a path prefix
+matching either pattern, including git.corp.example.com/xyzzy, rsc.io/private,
+and rsc.io/private/quux.
+
+The GOPRIVATE environment variable may be used by other tools as well to
+identify non-public modules. For example, an editor could use GOPRIVATE
+to decide whether to hyperlink a package import to a godoc.org page.
+
+For fine-grained control over module download and validation, the GONOPROXY
+and GONOSUMDB environment variables accept the same kind of glob list
+and override GOPRIVATE for the specific decision of whether to use the proxy
+and checksum database, respectively.
+
+For example, if a company ran a module proxy serving private modules,
+users would configure go using:
+
+	GOPRIVATE=*.corp.example.com
+	GOPROXY=proxy.example.com
+	GONOPROXY=none
+
+This would tell the go command and other tools that modules beginning with
+a corp.example.com subdomain are private but that the company proxy should
+be used for downloading both public and private modules, because
+GONOPROXY has been set to a pattern that won't match any modules,
+overriding GOPRIVATE.
+
+The 'go env -w' command (see 'go help env') can be used to set these variables
+for future go command invocations.
 `,
 }

@@ -11,6 +11,7 @@ package goobj
 import (
 	"bufio"
 	"bytes"
+	"cmd/internal/goobj2"
 	"cmd/internal/objabi"
 	"errors"
 	"fmt"
@@ -95,6 +96,7 @@ type Var struct {
 type Func struct {
 	Args     int64      // size in bytes of argument frame: inputs and outputs
 	Frame    int64      // size in bytes of local variable frame
+	Align    uint32     // alignment requirement in bytes for the address of the function
 	Leaf     bool       // function omits save of link register (ARM)
 	NoSplit  bool       // function omits stack split prologue
 	TopFrame bool       // function is the top of the call stack
@@ -129,13 +131,14 @@ type InlinedCall struct {
 
 // A Package is a parsed Go object file or archive defining a Go package.
 type Package struct {
-	ImportPath string          // import path denoting this package
-	Imports    []string        // packages imported by this package
-	SymRefs    []SymID         // list of symbol names and versions referred to by this pack
-	Syms       []*Sym          // symbols defined by this package
-	MaxVersion int64           // maximum Version in any SymID in Syms
-	Arch       string          // architecture
-	Native     []*NativeReader // native object data (e.g. ELF)
+	ImportPath    string          // import path denoting this package
+	Imports       []string        // packages imported by this package
+	SymRefs       []SymID         // list of symbol names and versions referred to by this pack
+	Syms          []*Sym          // symbols defined by this package
+	MaxVersion    int64           // maximum Version in any SymID in Syms
+	Arch          string          // architecture
+	Native        []*NativeReader // native object data (e.g. ELF)
+	DWARFFileList []string        // List of files for the DWARF .debug_lines section
 }
 
 type NativeReader struct {
@@ -501,8 +504,16 @@ func (r *objReader) parseObject(prefix []byte) error {
 	}
 	// TODO: extract OS + build ID if/when we need it
 
+	p, err := r.peek(8)
+	if err != nil {
+		return err
+	}
+	if bytes.Equal(p, []byte(goobj2.Magic)) {
+		r.readNew()
+		return nil
+	}
 	r.readFull(r.tmp[:8])
-	if !bytes.Equal(r.tmp[:8], []byte("\x00go112ld")) {
+	if !bytes.Equal(r.tmp[:8], []byte("\x00go114ld")) {
 		return r.error(errCorruptObject)
 	}
 
@@ -518,6 +529,12 @@ func (r *objReader) parseObject(prefix []byte) error {
 			break
 		}
 		r.p.Imports = append(r.p.Imports, s)
+	}
+
+	// Read filenames for dwarf info.
+	count := r.readInt()
+	for i := int64(0); i < count; i++ {
+		r.p.DWARFFileList = append(r.p.DWARFFileList, r.readString())
 	}
 
 	r.p.SymRefs = []SymID{{"", 0}}
@@ -575,6 +592,7 @@ func (r *objReader) parseObject(prefix []byte) error {
 			s.Func = f
 			f.Args = r.readInt()
 			f.Frame = r.readInt()
+			f.Align = uint32(r.readInt())
 			flags := r.readInt()
 			f.Leaf = flags&(1<<0) != 0
 			f.TopFrame = flags&(1<<4) != 0
@@ -619,7 +637,7 @@ func (r *objReader) parseObject(prefix []byte) error {
 	}
 
 	r.readFull(r.tmp[:7])
-	if !bytes.Equal(r.tmp[:7], []byte("go112ld")) {
+	if !bytes.Equal(r.tmp[:7], []byte("go114ld")) {
 		return r.error(errCorruptObject)
 	}
 
