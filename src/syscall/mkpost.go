@@ -2,6 +2,7 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
+//go:build ignore
 // +build ignore
 
 // mkpost processes the output of cgo -godefs to
@@ -14,7 +15,7 @@ package main
 import (
 	"fmt"
 	"go/format"
-	"io/ioutil"
+	"io"
 	"log"
 	"os"
 	"regexp"
@@ -22,7 +23,7 @@ import (
 )
 
 func main() {
-	b, err := ioutil.ReadAll(os.Stdin)
+	b, err := io.ReadAll(os.Stdin)
 	if err != nil {
 		log.Fatal(err)
 	}

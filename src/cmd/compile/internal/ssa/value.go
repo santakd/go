@@ -5,6 +5,7 @@
 package ssa
 
 import (
+	"cmd/compile/internal/ir"
 	"cmd/compile/internal/types"
 	"cmd/internal/src"
 	"fmt"
@@ -36,7 +37,7 @@ type Value struct {
 	// Users of AuxInt which interpret AuxInt as unsigned (e.g. shifts) must be careful.
 	// Use Value.AuxUnsigned to get the zero-extended value of AuxInt.
 	AuxInt int64
-	Aux    interface{}
+	Aux    Aux
 
 	// Arguments of this value
 	Args []*Value
@@ -53,6 +54,9 @@ type Value struct {
 	// wasm: Value stays on the WebAssembly stack. This value will not get a "register" (WebAssembly variable)
 	// nor a slot on Go stack, and the generation of this value is delayed to its use time.
 	OnWasmStack bool
+
+	// Is this value in the per-function constant cache? If so, remove from cache before changing it or recycling it.
+	InCache bool
 
 	// Storage for the first three args
 	argstorage [3]*Value
@@ -74,7 +78,7 @@ func (v *Value) String() string {
 }
 
 func (v *Value) AuxInt8() int8 {
-	if opcodeTable[v.Op].auxType != auxInt8 {
+	if opcodeTable[v.Op].auxType != auxInt8 && opcodeTable[v.Op].auxType != auxNameOffsetInt8 {
 		v.Fatalf("op %s doesn't have an int8 aux field", v.Op)
 	}
 	return int8(v.AuxInt)
@@ -126,8 +130,18 @@ func (v *Value) AuxValAndOff() ValAndOff {
 	return ValAndOff(v.AuxInt)
 }
 
+func (v *Value) AuxArm64BitField() arm64BitField {
+	if opcodeTable[v.Op].auxType != auxARM64BitField {
+		v.Fatalf("op %s doesn't have a ValAndOff aux field", v.Op)
+	}
+	return arm64BitField(v.AuxInt)
+}
+
 // long form print.  v# = opcode <type> [aux] args [: reg] (names)
 func (v *Value) LongString() string {
+	if v == nil {
+		return "<NIL VALUE>"
+	}
 	s := fmt.Sprintf("v%d = %s", v.ID, v.Op)
 	s += " <" + v.Type.String() + ">"
 	s += v.auxString()
@@ -176,23 +190,23 @@ func (v *Value) auxString() string {
 	case auxInt64, auxInt128:
 		return fmt.Sprintf(" [%d]", v.AuxInt)
 	case auxARM64BitField:
-		lsb := getARM64BFlsb(v.AuxInt)
-		width := getARM64BFwidth(v.AuxInt)
+		lsb := v.AuxArm64BitField().getARM64BFlsb()
+		width := v.AuxArm64BitField().getARM64BFwidth()
 		return fmt.Sprintf(" [lsb=%d,width=%d]", lsb, width)
 	case auxFloat32, auxFloat64:
 		return fmt.Sprintf(" [%g]", v.AuxFloat())
 	case auxString:
 		return fmt.Sprintf(" {%q}", v.Aux)
-	case auxSym, auxTyp:
+	case auxSym, auxCall, auxTyp:
 		if v.Aux != nil {
 			return fmt.Sprintf(" {%v}", v.Aux)
 		}
-	case auxSymOff, auxTypSize:
+	case auxSymOff, auxCallOff, auxTypSize, auxNameOffsetInt8:
 		s := ""
 		if v.Aux != nil {
 			s = fmt.Sprintf(" {%v}", v.Aux)
 		}
-		if v.AuxInt != 0 {
+		if v.AuxInt != 0 || opcodeTable[v.Op].auxType == auxNameOffsetInt8 {
 			s += fmt.Sprintf(" [%v]", v.AuxInt)
 		}
 		return s
@@ -203,9 +217,11 @@ func (v *Value) auxString() string {
 		}
 		return s + fmt.Sprintf(" [%s]", v.AuxValAndOff())
 	case auxCCop:
-		return fmt.Sprintf(" {%s}", v.Aux.(Op))
+		return fmt.Sprintf(" {%s}", Op(v.AuxInt))
 	case auxS390XCCMask, auxS390XRotateParams:
 		return fmt.Sprintf(" {%v}", v.Aux)
+	case auxFlagConstant:
+		return fmt.Sprintf("[%s]", flagConstant(v.AuxInt))
 	}
 	return ""
 }
@@ -323,8 +339,40 @@ func (v *Value) resetArgs() {
 // of cmd/compile by almost 10%, and slows it down.
 //go:noinline
 func (v *Value) reset(op Op) {
+	if v.InCache {
+		v.Block.Func.unCache(v)
+	}
 	v.Op = op
 	v.resetArgs()
+	v.AuxInt = 0
+	v.Aux = nil
+}
+
+// invalidateRecursively marks a value as invalid (unused)
+// and after decrementing reference counts on its Args,
+// also recursively invalidates any of those whose use
+// count goes to zero.
+//
+// BEWARE of doing this *before* you've applied intended
+// updates to SSA.
+func (v *Value) invalidateRecursively() {
+	if v.InCache {
+		v.Block.Func.unCache(v)
+	}
+	v.Op = OpInvalid
+
+	for _, a := range v.Args {
+		a.Uses--
+		if a.Uses == 0 {
+			a.invalidateRecursively()
+		}
+	}
+
+	v.argstorage[0] = nil
+	v.argstorage[1] = nil
+	v.argstorage[2] = nil
+	v.Args = v.argstorage[:0]
+
 	v.AuxInt = 0
 	v.Aux = nil
 }
@@ -333,6 +381,12 @@ func (v *Value) reset(op Op) {
 // It modifies v to be (Copy a).
 //go:noinline
 func (v *Value) copyOf(a *Value) {
+	if v == a {
+		return
+	}
+	if v.InCache {
+		v.Block.Func.unCache(v)
+	}
 	v.Op = OpCopy
 	v.resetArgs()
 	v.AddArg(a)
@@ -387,6 +441,23 @@ func (v *Value) Fatalf(msg string, args ...interface{}) {
 // isGenericIntConst reports whether v is a generic integer constant.
 func (v *Value) isGenericIntConst() bool {
 	return v != nil && (v.Op == OpConst64 || v.Op == OpConst32 || v.Op == OpConst16 || v.Op == OpConst8)
+}
+
+// ResultReg returns the result register assigned to v, in cmd/internal/obj/$ARCH numbering.
+// It is similar to Reg and Reg0, except that it is usable interchangeably for all Value Ops.
+// If you know v.Op, using Reg or Reg0 (as appropriate) will be more efficient.
+func (v *Value) ResultReg() int16 {
+	reg := v.Block.Func.RegAlloc[v.ID]
+	if reg == nil {
+		v.Fatalf("nil reg for value: %s\n%s\n", v.LongString(), v.Block.Func)
+	}
+	if pair, ok := reg.(LocPair); ok {
+		reg = pair[0]
+	}
+	if reg == nil {
+		v.Fatalf("nil reg0 for value: %s\n%s\n", v.LongString(), v.Block.Func)
+	}
+	return reg.(*Register).objNum
 }
 
 // Reg returns the register assigned to v, in cmd/internal/obj/$ARCH numbering.
@@ -450,4 +521,41 @@ func (v *Value) LackingPos() bool {
 	// with respect to their source position.
 	return v.Op == OpVarDef || v.Op == OpVarKill || v.Op == OpVarLive || v.Op == OpPhi ||
 		(v.Op == OpFwdRef || v.Op == OpCopy) && v.Type == types.TypeMem
+}
+
+// removeable reports whether the value v can be removed from the SSA graph entirely
+// if its use count drops to 0.
+func (v *Value) removeable() bool {
+	if v.Type.IsVoid() {
+		// Void ops, like nil pointer checks, must stay.
+		return false
+	}
+	if v.Type.IsMemory() {
+		// We don't need to preserve all memory ops, but we do need
+		// to keep calls at least (because they might have
+		// synchronization operations we can't see).
+		return false
+	}
+	if v.Op.HasSideEffects() {
+		// These are mostly synchronization operations.
+		return false
+	}
+	return true
+}
+
+// TODO(mdempsky): Shouldn't be necessary; see discussion at golang.org/cl/275756
+func (*Value) CanBeAnSSAAux() {}
+
+// AutoVar returns a *Name and int64 representing the auto variable and offset within it
+// where v should be spilled.
+func AutoVar(v *Value) (*ir.Name, int64) {
+	if loc, ok := v.Block.Func.RegAlloc[v.ID].(LocalSlot); ok {
+		if v.Type.Size() > loc.Type.Size() {
+			v.Fatalf("spill/restore type %s doesn't fit in slot type %s", v.Type, loc.Type)
+		}
+		return loc.N, loc.Off
+	}
+	// Assume it is a register, return its spill slot, which needs to be live
+	nameOff := v.Aux.(*AuxNameOffset)
+	return nameOff.Name, nameOff.Offset
 }

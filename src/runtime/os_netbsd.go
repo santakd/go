@@ -67,6 +67,11 @@ func lwp_self() int32
 
 func osyield()
 
+//go:nosplit
+func osyield_no_g() {
+	osyield()
+}
+
 func kqueue() int32
 
 //go:noescape
@@ -95,18 +100,28 @@ var sigset_all = sigset{[4]uint32{^uint32(0), ^uint32(0), ^uint32(0), ^uint32(0)
 
 // From NetBSD's <sys/sysctl.h>
 const (
-	_CTL_HW      = 6
-	_HW_NCPU     = 3
-	_HW_PAGESIZE = 7
+	_CTL_HW        = 6
+	_HW_NCPU       = 3
+	_HW_PAGESIZE   = 7
+	_HW_NCPUONLINE = 16
 )
 
-func getncpu() int32 {
-	mib := [2]uint32{_CTL_HW, _HW_NCPU}
-	out := uint32(0)
+func sysctlInt(mib []uint32) (int32, bool) {
+	var out int32
 	nout := unsafe.Sizeof(out)
-	ret := sysctl(&mib[0], 2, (*byte)(unsafe.Pointer(&out)), &nout, nil, 0)
-	if ret >= 0 {
-		return int32(out)
+	ret := sysctl(&mib[0], uint32(len(mib)), (*byte)(unsafe.Pointer(&out)), &nout, nil, 0)
+	if ret < 0 {
+		return 0, false
+	}
+	return out, true
+}
+
+func getncpu() int32 {
+	if n, ok := sysctlInt([]uint32{_CTL_HW, _HW_NCPUONLINE}); ok {
+		return int32(n)
+	}
+	if n, ok := sysctlInt([]uint32{_CTL_HW, _HW_NCPU}); ok {
+		return int32(n)
 	}
 	return 1
 }
@@ -213,7 +228,11 @@ func newosproc(mp *m) {
 	}
 }
 
-// netbsdMStart is the function call that starts executing a newly
+// mstart is the entry-point for new Ms.
+// It is written in assembly, uses ABI0, is marked TOPFRAME, and calls netbsdMstart0.
+func netbsdMstart()
+
+// netbsdMStart0 is the function call that starts executing a newly
 // created thread. On NetBSD, a new thread inherits the signal stack
 // of the creating thread. That confuses minit, so we remove that
 // signal stack here before calling the regular mstart. It's a bit
@@ -221,10 +240,10 @@ func newosproc(mp *m) {
 // it's a simple change that keeps NetBSD working like other OS's.
 // At this point all signals are blocked, so there is no race.
 //go:nosplit
-func netbsdMstart() {
+func netbsdMstart0() {
 	st := stackt{ss_flags: _SS_DISABLE}
 	sigaltstack(&st, nil)
-	mstart()
+	mstart0()
 }
 
 func osinit() {
@@ -278,6 +297,11 @@ func minit() {
 //go:nosplit
 func unminit() {
 	unminitSignals()
+}
+
+// Called from exitm, but not from drop, to undo the effect of thread-owned
+// resources in minit, semacreate, or elsewhere. Do not take locks after calling this.
+func mdestroy(mp *m) {
 }
 
 func sigtramp()

@@ -9,6 +9,7 @@ import (
 	"internal/poll"
 	"io"
 	"math/rand"
+	"os"
 	. "os"
 	"path/filepath"
 	"strconv"
@@ -105,7 +106,7 @@ func TestCopyFileRange(t *testing.T) {
 				t.Fatal(err)
 			}
 			if n != int64(len(data)) {
-				t.Fatalf("transfered %d, want %d", n, len(data))
+				t.Fatalf("transferred %d, want %d", n, len(data))
 			}
 			if !hook.called {
 				t.Fatalf("should have called poll.CopyFileRange")
@@ -129,7 +130,7 @@ func TestCopyFileRange(t *testing.T) {
 				t.Fatal(err)
 			}
 			if n != int64(len(data)) {
-				t.Fatalf("transfered %d, want %d", n, len(data))
+				t.Fatalf("transferred %d, want %d", n, len(data))
 			}
 			if !hook.called {
 				t.Fatalf("should have called poll.CopyFileRange")
@@ -161,7 +162,7 @@ func TestCopyFileRange(t *testing.T) {
 				t.Fatal(err)
 			}
 			if n != int64(len(data)) {
-				t.Fatalf("transfered %d, want %d", n, len(data))
+				t.Fatalf("transferred %d, want %d", n, len(data))
 			}
 			if !hook.called {
 				t.Fatalf("should have called poll.CopyFileRange")
@@ -169,6 +170,35 @@ func TestCopyFileRange(t *testing.T) {
 			mustSeekStart(t, dst)
 			mustContainData(t, dst, data)
 		})
+	})
+	t.Run("Nil", func(t *testing.T) {
+		var nilFile *File
+		anyFile, err := os.CreateTemp("", "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer Remove(anyFile.Name())
+		defer anyFile.Close()
+
+		if _, err := io.Copy(nilFile, nilFile); err != ErrInvalid {
+			t.Errorf("io.Copy(nilFile, nilFile) = %v, want %v", err, ErrInvalid)
+		}
+		if _, err := io.Copy(anyFile, nilFile); err != ErrInvalid {
+			t.Errorf("io.Copy(anyFile, nilFile) = %v, want %v", err, ErrInvalid)
+		}
+		if _, err := io.Copy(nilFile, anyFile); err != ErrInvalid {
+			t.Errorf("io.Copy(nilFile, anyFile) = %v, want %v", err, ErrInvalid)
+		}
+
+		if _, err := nilFile.ReadFrom(nilFile); err != ErrInvalid {
+			t.Errorf("nilFile.ReadFrom(nilFile) = %v, want %v", err, ErrInvalid)
+		}
+		if _, err := anyFile.ReadFrom(nilFile); err != ErrInvalid {
+			t.Errorf("anyFile.ReadFrom(nilFile) = %v, want %v", err, ErrInvalid)
+		}
+		if _, err := nilFile.ReadFrom(anyFile); err != ErrInvalid {
+			t.Errorf("nilFile.ReadFrom(anyFile) = %v, want %v", err, ErrInvalid)
+		}
 	})
 }
 
@@ -330,4 +360,36 @@ func (h *copyFileRangeHook) install() {
 
 func (h *copyFileRangeHook) uninstall() {
 	*PollCopyFileRangeP = h.original
+}
+
+// On some kernels copy_file_range fails on files in /proc.
+func TestProcCopy(t *testing.T) {
+	const cmdlineFile = "/proc/self/cmdline"
+	cmdline, err := os.ReadFile(cmdlineFile)
+	if err != nil {
+		t.Skipf("can't read /proc file: %v", err)
+	}
+	in, err := os.Open(cmdlineFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer in.Close()
+	outFile := filepath.Join(t.TempDir(), "cmdline")
+	out, err := os.Create(outFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.Copy(out, in); err != nil {
+		t.Fatal(err)
+	}
+	if err := out.Close(); err != nil {
+		t.Fatal(err)
+	}
+	copy, err := os.ReadFile(outFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(cmdline, copy) {
+		t.Errorf("copy of %q got %q want %q\n", cmdlineFile, copy, cmdline)
+	}
 }

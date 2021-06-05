@@ -6,10 +6,12 @@ package tls
 
 import (
 	"bytes"
+	"context"
 	"crypto"
 	"crypto/hmac"
 	"crypto/rsa"
 	"errors"
+	"fmt"
 	"hash"
 	"io"
 	"sync/atomic"
@@ -23,6 +25,7 @@ const maxClientPSKIdentities = 5
 
 type serverHandshakeStateTLS13 struct {
 	c               *Conn
+	ctx             context.Context
 	clientHello     *clientHelloMsg
 	hello           *serverHelloMsg
 	sentDummyCCS    bool
@@ -147,16 +150,12 @@ func (hs *serverHandshakeStateTLS13) processClientHello() error {
 	hs.hello.sessionId = hs.clientHello.sessionId
 	hs.hello.compressionMethod = compressionNone
 
-	var preferenceList, supportedList []uint16
-	if c.config.PreferServerCipherSuites {
-		preferenceList = defaultCipherSuitesTLS13()
-		supportedList = hs.clientHello.cipherSuites
-	} else {
-		preferenceList = hs.clientHello.cipherSuites
-		supportedList = defaultCipherSuitesTLS13()
+	preferenceList := defaultCipherSuitesTLS13
+	if !hasAESGCMHardwareSupport || !aesgcmPreferred(hs.clientHello.cipherSuites) {
+		preferenceList = defaultCipherSuitesTLS13NoAES
 	}
 	for _, suiteID := range preferenceList {
-		hs.suite = mutualCipherSuiteTLS13(supportedList, suiteID)
+		hs.suite = mutualCipherSuiteTLS13(hs.clientHello.cipherSuites, suiteID)
 		if hs.suite != nil {
 			break
 		}
@@ -361,7 +360,7 @@ func (hs *serverHandshakeStateTLS13) pickCertificate() error {
 		return c.sendAlert(alertMissingExtension)
 	}
 
-	certificate, err := c.config.getCertificate(clientHelloInfo(c, hs.clientHello))
+	certificate, err := c.config.getCertificate(clientHelloInfo(hs.ctx, c, hs.clientHello))
 	if err != nil {
 		if err == errNoCertificates {
 			c.sendAlert(alertUnrecognizedName)
@@ -552,11 +551,14 @@ func (hs *serverHandshakeStateTLS13) sendServerParameters() error {
 
 	encryptedExtensions := new(encryptedExtensionsMsg)
 
-	if len(hs.clientHello.alpnProtocols) > 0 {
-		if selectedProto, fallback := mutualProtocol(hs.clientHello.alpnProtocols, c.config.NextProtos); !fallback {
-			encryptedExtensions.alpnProtocol = selectedProto
-			c.clientProtocol = selectedProto
+	if len(c.config.NextProtos) > 0 && len(hs.clientHello.alpnProtocols) > 0 {
+		selectedProto := mutualProtocol(hs.clientHello.alpnProtocols, c.config.NextProtos)
+		if selectedProto == "" {
+			c.sendAlert(alertNoApplicationProtocol)
+			return fmt.Errorf("tls: client requested unsupported application protocols (%s)", hs.clientHello.alpnProtocols)
 		}
+		encryptedExtensions.alpnProtocol = selectedProto
+		c.clientProtocol = selectedProto
 	}
 
 	hs.transcript.Write(encryptedExtensions.marshal())

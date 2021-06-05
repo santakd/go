@@ -2,6 +2,7 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
+//go:build !math_big_pure_go && riscv64
 // +build !math_big_pure_go,riscv64
 
 #include "textflag.h"
@@ -19,9 +20,6 @@ TEXT ·mulWW(SB),NOSPLIT,$0
 	MOV	X8, z0+24(FP)
 	RET
 
-// func divWW(x1, x0, y Word) (q, r Word)
-TEXT ·divWW(SB),NOSPLIT,$0
-	JMP ·divWW_g(SB)		// riscv64 has no multiword division
 
 TEXT ·addVV(SB),NOSPLIT,$0
 	JMP ·addVV_g(SB)
@@ -47,5 +45,3 @@ TEXT ·mulAddVWW(SB),NOSPLIT,$0
 TEXT ·addMulVVW(SB),NOSPLIT,$0
 	JMP ·addMulVVW_g(SB)
 
-TEXT ·divWVW(SB),NOSPLIT,$0
-	JMP ·divWVW_g(SB)

@@ -2,7 +2,8 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-// +build dragonfly freebsd netbsd openbsd
+//go:build dragonfly || freebsd || netbsd || (openbsd && mips64)
+// +build dragonfly freebsd netbsd openbsd,mips64
 
 package syscall
 
@@ -89,8 +90,6 @@ func forkAndExecInChild(argv0 *byte, argv, envv []*byte, chroot, dir *byte, attr
 
 	// Fork succeeded, now in child.
 
-	runtime_AfterForkInChild()
-
 	// Enable tracing if requested.
 	if sys.Ptrace {
 		_, _, err1 = RawSyscall(SYS_PTRACE, uintptr(PTRACE_TRACEME), 0, 0)
@@ -117,14 +116,16 @@ func forkAndExecInChild(argv0 *byte, argv, envv []*byte, chroot, dir *byte, attr
 	}
 
 	if sys.Foreground {
-		pgrp := sys.Pgid
+		// This should really be pid_t, however _C_int (aka int32) is
+		// generally equivalent.
+		pgrp := _C_int(sys.Pgid)
 		if pgrp == 0 {
 			r1, _, err1 = RawSyscall(SYS_GETPID, 0, 0, 0)
 			if err1 != 0 {
 				goto childerror
 			}
 
-			pgrp = int(r1)
+			pgrp = _C_int(r1)
 		}
 
 		// Place process group in foreground.
@@ -133,6 +134,10 @@ func forkAndExecInChild(argv0 *byte, argv, envv []*byte, chroot, dir *byte, attr
 			goto childerror
 		}
 	}
+
+	// Restore the signal mask. We do this after TIOCSPGRP to avoid
+	// having the kernel send a SIGTTOU signal to the process group.
+	runtime_AfterForkInChild()
 
 	// Chroot
 	if chroot != nil {

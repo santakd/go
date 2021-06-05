@@ -2,6 +2,7 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
+//go:build !js
 // +build !js
 
 package net
@@ -160,7 +161,7 @@ func dialClosedPort(t *testing.T) (actual, expected time.Duration) {
 	// but other platforms should be instantaneous.
 	if runtime.GOOS == "windows" {
 		expected = 1500 * time.Millisecond
-	} else if runtime.GOOS == "darwin" {
+	} else if runtime.GOOS == "darwin" || runtime.GOOS == "ios" {
 		expected = 150 * time.Millisecond
 	} else {
 		expected = 95 * time.Millisecond
@@ -655,15 +656,7 @@ func TestDialerLocalAddr(t *testing.T) {
 		}
 		c, err := d.Dial(tt.network, addr)
 		if err == nil && tt.error != nil || err != nil && tt.error == nil {
-			// A suspected kernel bug in macOS 10.12 occasionally results in
-			// timeout errors when dialing address ::1. The errors have not
-			// been observed on newer versions of the OS, so we don't plan to work
-			// around them. See https://golang.org/issue/22019.
-			if tt.raddr == "::1" && os.Getenv("GO_BUILDER_NAME") == "darwin-amd64-10_12" && os.IsTimeout(err) {
-				t.Logf("ignoring timeout error on Darwin; see https://golang.org/issue/22019")
-			} else {
-				t.Errorf("%s %v->%s: got %v; want %v", tt.network, tt.laddr, tt.raddr, err, tt.error)
-			}
+			t.Errorf("%s %v->%s: got %v; want %v", tt.network, tt.laddr, tt.raddr, err, tt.error)
 		}
 		if err != nil {
 			if perr := parseDialError(err); perr != nil {
@@ -990,7 +983,7 @@ func TestDialerControl(t *testing.T) {
 // except that it won't skip testing on non-mobile builders.
 func mustHaveExternalNetwork(t *testing.T) {
 	t.Helper()
-	mobile := runtime.GOOS == "android" || runtime.GOOS == "darwin" && runtime.GOARCH == "arm64"
+	mobile := runtime.GOOS == "android" || runtime.GOOS == "ios"
 	if testenv.Builder() == "" || mobile {
 		testenv.MustHaveExternalNetwork(t)
 	}

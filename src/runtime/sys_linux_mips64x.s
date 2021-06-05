@@ -2,6 +2,7 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
+//go:build linux && (mips64 || mips64le)
 // +build linux
 // +build mips64 mips64le
 
@@ -213,14 +214,21 @@ TEXT runtime·mincore(SB),NOSPLIT|NOFRAME,$0-28
 	MOVW	R2, ret+24(FP)
 	RET
 
-// func walltime1() (sec int64, nsec int32)
-TEXT runtime·walltime1(SB),NOSPLIT,$16
+// func walltime() (sec int64, nsec int32)
+TEXT runtime·walltime(SB),NOSPLIT,$16-12
 	MOVV	R29, R16	// R16 is unchanged by C code
 	MOVV	R29, R1
 
 	MOVV	g_m(g), R17	// R17 = m
 
 	// Set vdsoPC and vdsoSP for SIGPROF traceback.
+	// Save the old values on stack and restore them on exit,
+	// so this function is reentrant.
+	MOVV	m_vdsoPC(R17), R2
+	MOVV	m_vdsoSP(R17), R3
+	MOVV	R2, 8(R29)
+	MOVV	R3, 16(R29)
+
 	MOVV	R31, m_vdsoPC(R17)
 	MOVV	R29, m_vdsoSP(R17)
 
@@ -243,13 +251,29 @@ noswitch:
 	BEQ	R25, fallback
 
 	JAL	(R25)
+	// check on vdso call return for kernel compatibility
+	// see https://golang.org/issues/39046
+	// if we get any error make fallback permanent.
+	BEQ	R2, R0, finish
+	MOVV	R0, runtime·vdsoClockgettimeSym(SB)
+	MOVW	$0, R4 // CLOCK_REALTIME
+	MOVV	$0(R29), R5
+	JMP	fallback
 
 finish:
 	MOVV	0(R29), R3	// sec
 	MOVV	8(R29), R5	// nsec
 
 	MOVV	R16, R29	// restore SP
-	MOVV	R0, m_vdsoSP(R17)	// clear vdsoSP
+	// Restore vdsoPC, vdsoSP
+	// We don't worry about being signaled between the two stores.
+	// If we are not in a signal handler, we'll restore vdsoSP to 0,
+	// and no one will care about vdsoPC. If we are in a signal handler,
+	// we cannot receive another signal.
+	MOVV	16(R29), R1
+	MOVV	R1, m_vdsoSP(R17)
+	MOVV	8(R29), R1
+	MOVV	R1, m_vdsoPC(R17)
 
 	MOVV	R3, sec+0(FP)
 	MOVW	R5, nsec+8(FP)
@@ -260,13 +284,20 @@ fallback:
 	SYSCALL
 	JMP finish
 
-TEXT runtime·nanotime1(SB),NOSPLIT,$16
+TEXT runtime·nanotime1(SB),NOSPLIT,$16-8
 	MOVV	R29, R16	// R16 is unchanged by C code
 	MOVV	R29, R1
 
 	MOVV	g_m(g), R17	// R17 = m
 
 	// Set vdsoPC and vdsoSP for SIGPROF traceback.
+	// Save the old values on stack and restore them on exit,
+	// so this function is reentrant.
+	MOVV	m_vdsoPC(R17), R2
+	MOVV	m_vdsoSP(R17), R3
+	MOVV	R2, 8(R29)
+	MOVV	R3, 16(R29)
+
 	MOVV	R31, m_vdsoPC(R17)
 	MOVV	R29, m_vdsoSP(R17)
 
@@ -289,13 +320,27 @@ noswitch:
 	BEQ	R25, fallback
 
 	JAL	(R25)
+	// see walltime for detail
+	BEQ	R2, R0, finish
+	MOVV	R0, runtime·vdsoClockgettimeSym(SB)
+	MOVW	$1, R4 // CLOCK_MONOTONIC
+	MOVV	$0(R29), R5
+	JMP	fallback
 
 finish:
 	MOVV	0(R29), R3	// sec
 	MOVV	8(R29), R5	// nsec
 
 	MOVV	R16, R29	// restore SP
-	MOVV	R0, m_vdsoSP(R17)	// clear vdsoSP
+	// Restore vdsoPC, vdsoSP
+	// We don't worry about being signaled between the two stores.
+	// If we are not in a signal handler, we'll restore vdsoSP to 0,
+	// and no one will care about vdsoPC. If we are in a signal handler,
+	// we cannot receive another signal.
+	MOVV	16(R29), R1
+	MOVV	R1, m_vdsoSP(R17)
+	MOVV	8(R29), R1
+	MOVV	R1, m_vdsoPC(R17)
 
 	// sec is in R3, nsec in R5
 	// return nsec in R3

@@ -76,6 +76,9 @@ func GoSyntax(inst Inst, pc uint64, symname func(uint64) (string, uint64)) strin
 		}
 		args = append(args, args[0])
 		return op + " " + strings.Join(args[1:], ",")
+	case PASTECC:
+		// paste. has two input registers, and an L field, unlike other 3 operand instructions.
+		return op + " " + args[0] + "," + args[1] + "," + args[2]
 	case SYNC:
 		if args[0] == "$1" {
 			return "LWSYNC"
@@ -112,7 +115,7 @@ func GoSyntax(inst Inst, pc uint64, symname func(uint64) (string, uint64)) strin
 	case STDCXCC, STWCXCC, STHCXCC, STBCXCC:
 		return op + " " + args[0] + ",(" + args[2] + ")(" + args[1] + ")"
 
-	case STXVD2X, STXVW4X, STXSDX, STVX, STVXL, STVEBX, STVEHX, STVEWX, STXSIWX, STFDX, STFDUX, STFDPX, STFSX, STFSUX:
+	case STXVX, STXVD2X, STXVW4X, STXVH8X, STXVB16X, STXSDX, STVX, STVXL, STVEBX, STVEHX, STVEWX, STXSIWX, STFDX, STFDUX, STFDPX, STFSX, STFSUX:
 		return op + " " + args[0] + ",(" + args[2] + ")(" + args[1] + ")"
 
 	case STXV:
@@ -127,7 +130,7 @@ func GoSyntax(inst Inst, pc uint64, symname func(uint64) (string, uint64)) strin
 		}
 		return op + " (" + args[2] + ")(" + args[1] + ")," + args[0]
 
-	case LXVD2X, LXVW4X, LVX, LVXL, LVSR, LVSL, LVEBX, LVEHX, LVEWX, LXSDX, LXSIWAX:
+	case LXVX, LXVD2X, LXVW4X, LXVH8X, LXVB16X, LVX, LVXL, LVSR, LVSL, LVEBX, LVEHX, LVEWX, LXSDX, LXSIWAX:
 		return op + " (" + args[2] + ")(" + args[1] + ")," + args[0]
 
 	case LXV:
@@ -136,7 +139,7 @@ func GoSyntax(inst Inst, pc uint64, symname func(uint64) (string, uint64)) strin
 	case LXVL, LXVLL:
 		return op + " " + args[1] + "," + args[2] + "," + args[0]
 
-	case DCBT, DCBTST, DCBZ, DCBST, DCBI, ICBI:
+	case DCBT, DCBTST, DCBZ, DCBST, ICBI:
 		if args[0] == "0" || args[0] == "R0" {
 			return op + " (" + args[1] + ")"
 		}
@@ -332,6 +335,7 @@ var plan9OpMap = map[Op]string{
 	DIVDUO:    "DIVDUV",
 	DIVDUOCC:  "DIVDUVCC",
 	ADDI:      "ADD",
+	MULLI:     "MULLD",
 	SRADI:     "SRAD",
 	SUBF:      "SUB",
 	STBCXCC:   "STBCCC",

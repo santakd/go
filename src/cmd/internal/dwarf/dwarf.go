@@ -9,29 +9,19 @@ package dwarf
 
 import (
 	"bytes"
-	"cmd/internal/objabi"
 	"errors"
 	"fmt"
-	"os/exec"
+	"internal/buildcfg"
+	exec "internal/execabs"
 	"sort"
 	"strconv"
 	"strings"
-)
 
-// TODO(go115newobj): clean up. Some constant prefixes here are no longer
-// needed in the new object files.
+	"cmd/internal/objabi"
+)
 
 // InfoPrefix is the prefix for all the symbols containing DWARF info entries.
 const InfoPrefix = "go.info."
-
-// RangePrefix is the prefix for all the symbols containing DWARF location lists.
-const LocPrefix = "go.loc."
-
-// RangePrefix is the prefix for all the symbols containing DWARF range lists.
-const RangePrefix = "go.range."
-
-// DebugLinesPrefix is the prefix for all the symbols containing DWARF debug_line information from the compiler.
-const DebugLinesPrefix = "go.debuglines."
 
 // ConstInfoPrefix is the prefix for all symbols containing DWARF info
 // entries that contain constants.
@@ -113,26 +103,26 @@ func EnableLogging(doit bool) {
 	logDwarf = doit
 }
 
-// UnifyRanges merges the list of ranges of c into the list of ranges of s
-func (s *Scope) UnifyRanges(c *Scope) {
-	out := make([]Range, 0, len(s.Ranges)+len(c.Ranges))
-
+// MergeRanges creates a new range list by merging the ranges from
+// its two arguments, then returns the new list.
+func MergeRanges(in1, in2 []Range) []Range {
+	out := make([]Range, 0, len(in1)+len(in2))
 	i, j := 0, 0
 	for {
 		var cur Range
-		if i < len(s.Ranges) && j < len(c.Ranges) {
-			if s.Ranges[i].Start < c.Ranges[j].Start {
-				cur = s.Ranges[i]
+		if i < len(in2) && j < len(in1) {
+			if in2[i].Start < in1[j].Start {
+				cur = in2[i]
 				i++
 			} else {
-				cur = c.Ranges[j]
+				cur = in1[j]
 				j++
 			}
-		} else if i < len(s.Ranges) {
-			cur = s.Ranges[i]
+		} else if i < len(in2) {
+			cur = in2[i]
 			i++
-		} else if j < len(c.Ranges) {
-			cur = c.Ranges[j]
+		} else if j < len(in1) {
+			cur = in1[j]
 			j++
 		} else {
 			break
@@ -145,7 +135,12 @@ func (s *Scope) UnifyRanges(c *Scope) {
 		}
 	}
 
-	s.Ranges = out
+	return out
+}
+
+// UnifyRanges merges the ranges from 'c' into the list of ranges for 's'.
+func (s *Scope) UnifyRanges(c *Scope) {
+	s.Ranges = MergeRanges(s.Ranges, c.Ranges)
 }
 
 // AppendRange adds r to s, if r is non-empty.
@@ -325,8 +320,6 @@ const (
 )
 
 // Index into the abbrevs table below.
-// Keep in sync with ispubname() and ispubtype() in ld/dwarf.go.
-// ispubtype considers >= NULLTYPE public
 const (
 	DW_ABRV_NULL = iota
 	DW_ABRV_COMPUNIT
@@ -390,7 +383,7 @@ func expandPseudoForm(form uint8) uint8 {
 		return form
 	}
 	expandedForm := DW_FORM_udata
-	if objabi.GOOS == "darwin" {
+	if buildcfg.GOOS == "darwin" || buildcfg.GOOS == "ios" {
 		expandedForm = DW_FORM_data4
 	}
 	return uint8(expandedForm)
@@ -398,9 +391,9 @@ func expandPseudoForm(form uint8) uint8 {
 
 // Abbrevs() returns the finalized abbrev array for the platform,
 // expanding any DW_FORM pseudo-ops to real values.
-func Abbrevs() [DW_NABRV]dwAbbrev {
+func Abbrevs() []dwAbbrev {
 	if abbrevsFinalized {
-		return abbrevs
+		return abbrevs[:]
 	}
 	for i := 1; i < DW_NABRV; i++ {
 		for j := 0; j < len(abbrevs[i].attr); j++ {
@@ -408,7 +401,7 @@ func Abbrevs() [DW_NABRV]dwAbbrev {
 		}
 	}
 	abbrevsFinalized = true
-	return abbrevs
+	return abbrevs[:]
 }
 
 // abbrevs is a raw table of abbrev entries; it needs to be post-processed
@@ -1050,6 +1043,15 @@ func PutIntConst(ctxt Context, info, typ Sym, name string, val int64) {
 	putattr(ctxt, info, DW_ABRV_INT_CONSTANT, DW_FORM_sdata, DW_CLS_CONSTANT, val, nil)
 }
 
+// PutGlobal writes a DIE for a global variable.
+func PutGlobal(ctxt Context, info, typ, gvar Sym, name string) {
+	Uleb128put(ctxt, info, DW_ABRV_VARIABLE)
+	putattr(ctxt, info, DW_ABRV_VARIABLE, DW_FORM_string, DW_CLS_STRING, int64(len(name)), name)
+	putattr(ctxt, info, DW_ABRV_VARIABLE, DW_FORM_block1, DW_CLS_ADDRESS, 0, gvar)
+	putattr(ctxt, info, DW_ABRV_VARIABLE, DW_FORM_ref_addr, DW_CLS_REFERENCE, 0, typ)
+	putattr(ctxt, info, DW_ABRV_VARIABLE, DW_FORM_flag, DW_CLS_FLAG, 1, nil)
+}
+
 // PutBasedRanges writes a range table to sym. All addresses in ranges are
 // relative to some base address, which must be arranged by the caller
 // (e.g., with a DW_AT_low_pc attribute, or in a BASE-prefixed range).
@@ -1264,7 +1266,7 @@ func PutAbstractFunc(ctxt Context, s *FnState) error {
 // its corresponding 'abstract' DIE (containing location-independent
 // attributes such as name, type, etc). Inlined subroutine DIEs can
 // have other inlined subroutine DIEs as children.
-func PutInlinedFunc(ctxt Context, s *FnState, callersym Sym, callIdx int) error {
+func putInlinedFunc(ctxt Context, s *FnState, callersym Sym, callIdx int) error {
 	ic := s.InlCalls.Calls[callIdx]
 	callee := ic.AbsFunSym
 
@@ -1275,7 +1277,7 @@ func PutInlinedFunc(ctxt Context, s *FnState, callersym Sym, callIdx int) error 
 	Uleb128put(ctxt, s.Info, int64(abbrev))
 
 	if logDwarf {
-		ctxt.Logf("PutInlinedFunc(caller=%v,callee=%v,abbrev=%d)\n", callersym, callee, abbrev)
+		ctxt.Logf("putInlinedFunc(caller=%v,callee=%v,abbrev=%d)\n", callersym, callee, abbrev)
 	}
 
 	// Abstract origin.
@@ -1311,7 +1313,7 @@ func PutInlinedFunc(ctxt Context, s *FnState, callersym Sym, callIdx int) error 
 	// Children of this inline.
 	for _, sib := range inlChildren(callIdx, &s.InlCalls) {
 		absfn := s.InlCalls.Calls[sib].AbsFunSym
-		err := PutInlinedFunc(ctxt, s, absfn, sib)
+		err := putInlinedFunc(ctxt, s, absfn, sib)
 		if err != nil {
 			return err
 		}
@@ -1353,7 +1355,7 @@ func PutConcreteFunc(ctxt Context, s *FnState) error {
 	// Inlined subroutines.
 	for _, sib := range inlChildren(-1, &s.InlCalls) {
 		absfn := s.InlCalls.Calls[sib].AbsFunSym
-		err := PutInlinedFunc(ctxt, s, absfn, sib)
+		err := putInlinedFunc(ctxt, s, absfn, sib)
 		if err != nil {
 			return err
 		}
@@ -1401,7 +1403,7 @@ func PutDefaultFunc(ctxt Context, s *FnState) error {
 	// Inlined subroutines.
 	for _, sib := range inlChildren(-1, &s.InlCalls) {
 		absfn := s.InlCalls.Calls[sib].AbsFunSym
-		err := PutInlinedFunc(ctxt, s, absfn, sib)
+		err := putInlinedFunc(ctxt, s, absfn, sib)
 		if err != nil {
 			return err
 		}
@@ -1606,14 +1608,6 @@ func putvar(ctxt Context, s *FnState, v *Var, absfn Sym, fnabbrev, inlIndex int,
 
 	// Var has no children => no terminator
 }
-
-// VarsByOffset attaches the methods of sort.Interface to []*Var,
-// sorting in increasing StackOffset.
-type VarsByOffset []*Var
-
-func (s VarsByOffset) Len() int           { return len(s) }
-func (s VarsByOffset) Less(i, j int) bool { return s[i].StackOffset < s[j].StackOffset }
-func (s VarsByOffset) Swap(i, j int)      { s[i], s[j] = s[j], s[i] }
 
 // byChildIndex implements sort.Interface for []*dwarf.Var by child index.
 type byChildIndex []*Var

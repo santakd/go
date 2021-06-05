@@ -130,12 +130,12 @@ if [ "$(uname -s)" = "GNU/kFreeBSD" ]; then
 	export CGO_ENABLED=0
 fi
 
-# On Alpine Linux, use the musl dynamic linker/loader
-if [ -f "/etc/alpine-release" ]; then
-	if type readelf >/dev/null 2>&1; then
-		echo "int main() { return 0; }" | ${CC:-gcc} -o ./test-alpine-ldso -x c -
-		export GO_LDSO=$(readelf -l ./test-alpine-ldso | grep 'interpreter:' | sed -e 's/^.*interpreter: \(.*\)[]]/\1/')
-		rm -f ./test-alpine-ldso
+# Test which linker/loader our system is using
+if type readelf >/dev/null 2>&1; then
+	if echo "int main() { return 0; }" | ${CC:-cc} -o ./test-musl-ldso -x c - >/dev/null 2>&1; then
+		LDSO=$(readelf -l ./test-musl-ldso | grep 'interpreter:' | sed -e 's/^.*interpreter: \(.*\)[]]/\1/') >/dev/null 2>&1
+		[ -z "$LDSO" ] || export GO_LDSO="$LDSO"
+		rm -f ./test-musl-ldso
 	fi
 fi
 
@@ -162,15 +162,18 @@ IFS=$'\n'; for go_exe in $(type -ap go); do
 		fi
 	fi
 done; unset IFS
-GOROOT_BOOTSTRAP_VERSION=$($GOROOT_BOOTSTRAP/bin/go version | sed 's/go version //')
-echo "Building Go cmd/dist using $GOROOT_BOOTSTRAP. ($GOROOT_BOOTSTRAP_VERSION)"
-if $verbose; then
-	echo cmd/dist
-fi
 if [ ! -x "$GOROOT_BOOTSTRAP/bin/go" ]; then
 	echo "ERROR: Cannot find $GOROOT_BOOTSTRAP/bin/go." >&2
 	echo "Set \$GOROOT_BOOTSTRAP to a working Go tree >= Go 1.4." >&2
 	exit 1
+fi
+# Get the exact bootstrap toolchain version to help with debugging.
+# We clear GOOS and GOARCH to avoid an ominous but harmless warning if
+# the bootstrap doesn't support them.
+GOROOT_BOOTSTRAP_VERSION=$(GOOS= GOARCH= $GOROOT_BOOTSTRAP/bin/go version | sed 's/go version //')
+echo "Building Go cmd/dist using $GOROOT_BOOTSTRAP. ($GOROOT_BOOTSTRAP_VERSION)"
+if $verbose; then
+	echo cmd/dist
 fi
 if [ "$GOROOT_BOOTSTRAP" = "$GOROOT" ]; then
 	echo "ERROR: \$GOROOT_BOOTSTRAP must not be set to \$GOROOT" >&2

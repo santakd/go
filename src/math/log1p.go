@@ -92,7 +92,12 @@ package math
 //	Log1p(-1) = -Inf
 //	Log1p(x < -1) = NaN
 //	Log1p(NaN) = NaN
-func Log1p(x float64) float64
+func Log1p(x float64) float64 {
+	if haveArchLog1p {
+		return archLog1p(x)
+	}
+	return log1p(x)
+}
 
 func log1p(x float64) float64 {
 	const (
@@ -122,10 +127,7 @@ func log1p(x float64) float64 {
 		return Inf(1)
 	}
 
-	absx := x
-	if absx < 0 {
-		absx = -absx
-	}
+	absx := Abs(x)
 
 	var f float64
 	var iu uint64

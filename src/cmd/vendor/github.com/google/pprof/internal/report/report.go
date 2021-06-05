@@ -79,6 +79,8 @@ type Options struct {
 	Symbol     *regexp.Regexp // Symbols to include on disassembly report.
 	SourcePath string         // Search path for source files.
 	TrimPath   string         // Paths to trim from source file paths.
+
+	IntelSyntax bool // Whether or not to print assembly in Intel syntax.
 }
 
 // Generate generates a report as directed by the Report.
@@ -438,12 +440,12 @@ func PrintAssembly(w io.Writer, rpt *Report, obj plugin.ObjTool, maxFuncs int) e
 		flatSum, cumSum := sns.Sum()
 
 		// Get the function assembly.
-		insts, err := obj.Disasm(s.sym.File, s.sym.Start, s.sym.End)
+		insts, err := obj.Disasm(s.sym.File, s.sym.Start, s.sym.End, o.IntelSyntax)
 		if err != nil {
 			return err
 		}
 
-		ns := annotateAssembly(insts, sns, s.base)
+		ns := annotateAssembly(insts, sns, s.file)
 
 		fmt.Fprintf(w, "ROUTINE ======================== %s\n", s.sym.Name[0])
 		for _, name := range s.sym.Name[1:] {
@@ -532,7 +534,6 @@ func symbolsFromBinaries(prof *profile.Profile, g *graph.Graph, rx *regexp.Regex
 			addr = *address
 		}
 		msyms, err := f.Symbols(rx, addr)
-		base := f.Base()
 		f.Close()
 		if err != nil {
 			continue
@@ -541,7 +542,6 @@ func symbolsFromBinaries(prof *profile.Profile, g *graph.Graph, rx *regexp.Regex
 			objSyms = append(objSyms,
 				&objSymbol{
 					sym:  ms,
-					base: base,
 					file: f,
 				},
 			)
@@ -556,7 +556,6 @@ func symbolsFromBinaries(prof *profile.Profile, g *graph.Graph, rx *regexp.Regex
 // added to correspond to sample addresses
 type objSymbol struct {
 	sym  *plugin.Sym
-	base uint64
 	file plugin.ObjFile
 }
 
@@ -576,8 +575,7 @@ func nodesPerSymbol(ns graph.Nodes, symbols []*objSymbol) map[*objSymbol]graph.N
 	for _, s := range symbols {
 		// Gather samples for this symbol.
 		for _, n := range ns {
-			address := n.Info.Address - s.base
-			if address >= s.sym.Start && address < s.sym.End {
+			if address, err := s.file.ObjAddr(n.Info.Address); err == nil && address >= s.sym.Start && address < s.sym.End {
 				symNodes[s] = append(symNodes[s], n)
 			}
 		}
@@ -619,7 +617,7 @@ func (a *assemblyInstruction) cumValue() int64 {
 // annotateAssembly annotates a set of assembly instructions with a
 // set of samples. It returns a set of nodes to display. base is an
 // offset to adjust the sample addresses.
-func annotateAssembly(insts []plugin.Inst, samples graph.Nodes, base uint64) []assemblyInstruction {
+func annotateAssembly(insts []plugin.Inst, samples graph.Nodes, file plugin.ObjFile) []assemblyInstruction {
 	// Add end marker to simplify printing loop.
 	insts = append(insts, plugin.Inst{
 		Addr: ^uint64(0),
@@ -643,7 +641,10 @@ func annotateAssembly(insts []plugin.Inst, samples graph.Nodes, base uint64) []a
 
 		// Sum all the samples until the next instruction (to account
 		// for samples attributed to the middle of an instruction).
-		for next := insts[ix+1].Addr; s < len(samples) && samples[s].Info.Address-base < next; s++ {
+		for next := insts[ix+1].Addr; s < len(samples); s++ {
+			if addr, err := file.ObjAddr(samples[s].Info.Address); err != nil || addr >= next {
+				break
+			}
 			sample := samples[s]
 			n.flatDiv += sample.FlatDiv
 			n.flat += sample.Flat
@@ -1201,6 +1202,13 @@ func reportLabels(rpt *Report, g *graph.Graph, origCount, droppedNodes, droppedE
 				nodeCount, origCount))
 		}
 	}
+
+	// Help new users understand the graph.
+	// A new line is intentionally added here to better show this message.
+	if fullHeaders {
+		label = append(label, "\nSee https://git.io/JfYMW for how to read the graph")
+	}
+
 	return label
 }
 

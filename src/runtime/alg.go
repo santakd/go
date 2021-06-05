@@ -15,25 +15,6 @@ const (
 	c1 = uintptr((8-sys.PtrSize)/4*3267000013 + (sys.PtrSize-4)/4*23344194077549503)
 )
 
-// type algorithms - known to compiler
-const (
-	alg_NOEQ = iota
-	alg_MEM0
-	alg_MEM8
-	alg_MEM16
-	alg_MEM32
-	alg_MEM64
-	alg_MEM128
-	alg_STRING
-	alg_INTER
-	alg_NILINTER
-	alg_FLOAT32
-	alg_FLOAT64
-	alg_CPLX64
-	alg_CPLX128
-	alg_max
-)
-
 func memhash0(p unsafe.Pointer, h uintptr) uintptr {
 	return h
 }
@@ -197,28 +178,11 @@ func typehash(t *_type, p unsafe.Pointer, h uintptr) uintptr {
 		return h
 	case kindStruct:
 		s := (*structtype)(unsafe.Pointer(t))
-		memStart := uintptr(0)
-		memEnd := uintptr(0)
 		for _, f := range s.fields {
-			if memEnd > memStart && (f.name.isBlank() || f.offset() != memEnd || f.typ.tflag&tflagRegularMemory == 0) {
-				// flush any pending regular memory hashing
-				h = memhash(add(p, memStart), h, memEnd-memStart)
-				memStart = memEnd
-			}
 			if f.name.isBlank() {
 				continue
 			}
-			if f.typ.tflag&tflagRegularMemory == 0 {
-				h = typehash(f.typ, add(p, f.offset()), h)
-				continue
-			}
-			if memStart == memEnd {
-				memStart = f.offset()
-			}
-			memEnd = f.offset() + f.typ.size
-		}
-		if memEnd > memStart {
-			h = memhash(add(p, memStart), h, memEnd-memStart)
+			h = typehash(f.typ, add(p, f.offset()), h)
 		}
 		return h
 	default:

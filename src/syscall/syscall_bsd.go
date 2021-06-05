@@ -2,6 +2,7 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
+//go:build darwin || dragonfly || freebsd || netbsd || openbsd
 // +build darwin dragonfly freebsd netbsd openbsd
 
 // BSD system call wrappers shared by *BSD based systems
@@ -16,6 +17,21 @@ import (
 	"runtime"
 	"unsafe"
 )
+
+const ImplementsGetwd = true
+
+func Getwd() (string, error) {
+	var buf [pathMax]byte
+	_, err := getcwd(buf[:])
+	if err != nil {
+		return "", err
+	}
+	n := clen(buf[:])
+	if n < 1 {
+		return "", EINVAL
+	}
+	return string(buf[:n]), nil
+}
 
 /*
  * Wrapped
@@ -277,7 +293,7 @@ func Accept(fd int) (nfd int, sa Sockaddr, err error) {
 	if err != nil {
 		return
 	}
-	if runtime.GOOS == "darwin" && len == 0 {
+	if (runtime.GOOS == "darwin" || runtime.GOOS == "ios") && len == 0 {
 		// Accepted socket has no address.
 		// This is likely due to a bug in xnu kernels,
 		// where instead of ECONNABORTED error socket

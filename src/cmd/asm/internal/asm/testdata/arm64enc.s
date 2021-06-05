@@ -188,7 +188,7 @@ TEXT asmtest(SB),DUPOK|NOSPLIT,$-8
    MOVBU 2916(R24), R3                        // 03936d39
    MOVBU (R19)(R14<<0), R23                   // 777a6e38
    MOVBU (R2)(R8.SXTX), R19                   // 53e86838
-   MOVBU (R27)(R23), R14                      // MOVBU (R27)(R23*1), R14     // 6e6b7738
+   MOVBU (R27)(R23), R14                      // 6e6b7738
    MOVHU.P 107(R14), R13                      // cdb54678
    MOVHU.W 192(R3), R2                        // 620c4c78
    MOVHU 6844(R4), R19                        // 93787579
@@ -201,9 +201,9 @@ TEXT asmtest(SB),DUPOK|NOSPLIT,$-8
    MOVB 997(R9), R23                          // 37958f39
    //TODO MOVBW (R2<<1)(R21), R15             // af7ae238
    //TODO MOVBW (R26)(R0), R21                // 1568fa38
-   MOVB (R5)(R15), R16                        // MOVB (R5)(R15*1), R16         // b068af38
+   MOVB (R5)(R15), R16                        // b068af38
    MOVB (R19)(R26.SXTW), R19                  // 73caba38
-   MOVB (R29)(R30), R14                       // MOVB (R29)(R30*1), R14        // ae6bbe38
+   MOVB (R29)(R30), R14                       // ae6bbe38
    //TODO MOVHW.P 218(R22), R25               // d9a6cd78
    MOVH.P 179(R23), R5                        // e5368b78
    //TODO MOVHW.W 136(R2), R27                // 5b8cc878
@@ -357,12 +357,12 @@ TEXT asmtest(SB),DUPOK|NOSPLIT,$-8
    MOVD R25, -137(R17)                        // 397217f8
    MOVW R4, (R12)(R22.UXTW<<2)                // 845936b8
    MOVD R27, (R5)(R15.UXTW<<3)                // bb582ff8
-   MOVB R2, (R10)(R16)                        // MOVB R2, (R10)(R16*1)         // 42693038
-   MOVB R2, (R29)(R26)                        // MOVB R2, (R29)(R26*1)         // a26b3a38
+   MOVB R2, (R10)(R16)                        // 42693038
+   MOVB R2, (R29)(R26)                        // a26b3a38
    MOVH R11, -80(R23)                         // eb021b78
    MOVH R11, (R27)(R14.SXTW<<1)               // 6bdb2e78
-   MOVB R19, (R0)(R4)                         // MOVB R19, (R0)(R4*1)          // 13682438
-   MOVB R1, (R6)(R4)                          // MOVB R1, (R6)(R4*1)           // c1682438
+   MOVB R19, (R0)(R4)                         // 13682438
+   MOVB R1, (R6)(R4)                          // c1682438
    MOVH R3, (R11)(R13<<1)                     // 63792d78
    //TODO STTR 55(R4), R29                    // 9d7803b8
    //TODO STTR 124(R5), R25                   // b9c807f8
@@ -420,6 +420,7 @@ TEXT asmtest(SB),DUPOK|NOSPLIT,$-8
    UXTBW R2, R6                               // 461c0053
    UXTHW R7, R20                              // f43c0053
    VCNT V0.B8, V0.B8                          // 0058200e
+   VCNT V0.B16, V0.B16                        // 0058204e
    WFE                                        // 5f2003d5
    WFI                                        // 7f2003d5
    YIELD                                      // 3f2003d5
@@ -590,7 +591,7 @@ TEXT asmtest(SB),DUPOK|NOSPLIT,$-8
    FMOVS R8, F15                              // 0f01271e
    FMOVD F2, F9                               // 4940601e
    FMOVS F4, F27                              // 9b40201e
-   //TODO VFMOV $3.125, V8.2D                 // 28f5006f
+   //TODO VFMOV $3.125, V8.D2                 // 28f5006f
    FMSUBS F13, F21, F13, F19                  // b3d50d1f
    FMSUBD F11, F7, F15, F31                   // ff9d4b1f
    //TODO VFMUL V9.S[2], F21, F19             // b39a895f
@@ -647,7 +648,7 @@ TEXT asmtest(SB),DUPOK|NOSPLIT,$-8
    FSUBS F25, F23, F0                         // e03a391e
    FSUBD F11, F13, F24                        // b8396b1e
    //TODO SCVTFSS F30, F20                    // d4db215e
-   //TODO VSCVTF V7.2S, V17.2S                // f1d8210e
+   //TODO VSCVTF V7.S2, V17.S2                // f1d8210e
    SCVTFWS R3, F16                            // 7000221e
    SCVTFWD R20, F4                            // 8402621e
    SCVTFS R16, F12                            // 0c02229e
@@ -668,6 +669,7 @@ TEXT asmtest(SB),DUPOK|NOSPLIT,$-8
    VCMEQ V24.S4, V13.S4, V12.S4                                // ac8db86e
    VCNT V13.B8, V11.B8                                         // ab59200e
    VMOV V31.B[15], V18                                         // f2071f5e
+   VDUP V31.B[15], V18                                         // f2071f5e
    VDUP V31.B[13], V20.B16                                     // f4071b4e
    VEOR V4.B8, V18.B8, V7.B8                                   // 471e242e
    VEXT $4, V2.B8, V1.B8, V3.B8                                // 2320022e
@@ -678,27 +680,28 @@ TEXT asmtest(SB),DUPOK|NOSPLIT,$-8
    VLD1 (R24), [V18.D1, V19.D1, V20.D1]                        // 126f400c
    VLD1 (R29), [V14.D1, V15.D1, V16.D1, V17.D1]                // ae2f400c
    VLD1.P 16(R23), [V1.B16]                                    // e172df4c
-   VLD1.P (R6)(R11), [V31.D1]                                  // VLD1.P (R6)(R11*1), [V31.D1]                 // df7ccb0c
+   VLD1.P (R6)(R11), [V31.D1]                                  // df7ccb0c
    VLD1.P 16(R7), [V31.D1, V0.D1]                              // ffacdf0c
-   VLD1.P (R19)(R4), [V24.B8, V25.B8]                          // VLD1.P (R19)(R4*1), [V24.B8, V25.B8]         // 78a2c40c
-   VLD1.P (R20)(R8), [V7.H8, V8.H8, V9.H8]                     // VLD1.P (R20)(R8*1), [V7.H8, V8.H8, V9.H8]    // 8766c84c
+   VLD1.P (R19)(R4), [V24.B8, V25.B8]                          // 78a2c40c
+   VLD1.P (R20)(R8), [V7.H8, V8.H8, V9.H8]                     // 8766c84c
    VLD1.P 32(R30), [V5.B8, V6.B8, V7.B8, V8.B8]                // c523df0c
    VLD1 (R19), V14.B[15]                                       // 6e1e404d
    VLD1 (R29), V0.H[1]                                         // a04b400d
    VLD1 (R27), V2.S[0]                                         // 6283400d
    VLD1 (R21), V5.D[1]                                         // a586404d
    VLD1.P 1(R19), V10.B[14]                                    // 6a1adf4d
-   VLD1.P (R3)(R14), V16.B[11]                                 // VLD1.P (R3)(R14*1), V16.B[11]                // 700cce4d
+   VLD1.P (R3)(R14), V16.B[11]                                 // 700cce4d
    VLD1.P 2(R1), V28.H[2]                                      // 3c50df0d
-   VLD1.P (R13)(R20), V9.H[2]                                  // VLD1.P (R13)(R20*1), V9.H[2]                 // a951d40d
+   VLD1.P (R13)(R20), V9.H[2]                                  // a951d40d
    VLD1.P 4(R17), V1.S[3]                                      // 2192df4d
-   VLD1.P (R14)(R2), V17.S[2]                                  // VLD1.P (R14)(R2*1), V17.S[2]                 // d181c24d
+   VLD1.P (R14)(R2), V17.S[2]                                  // d181c24d
    VLD1.P 8(R5), V30.D[1]                                      // be84df4d
-   VLD1.P (R27)(R13), V27.D[0]                                 // VLD1.P (R27)(R13*1), V27.D[0]                // 7b87cd0d
+   VLD1.P (R27)(R13), V27.D[0]                                 // 7b87cd0d
    //TODO FMOVS.P -29(RSP), F8                                 // e8375ebc
    //TODO FMOVS.W 71(R29), F28                                 // bc7f44bc
    FMOVS 6160(R4), F23                                         // 971058bd
    VMOV V18.B[10], V27                                         // 5b06155e
+   VDUP V18.B[10], V27                                         // 5b06155e
    VMOV V12.B[2], V28.B[12]                                    // 9c15196e
    VMOV R30, V4.B[13]                                          // c41f1b4e
    VMOV V2.B16, V4.B16                                         // 441ca24e
@@ -731,25 +734,25 @@ TEXT asmtest(SB),DUPOK|NOSPLIT,$-8
    VSHL $7, V22.D2, V25.D2                                     // d956474f
    VST1 [V14.H4, V15.H4, V16.H4], (R27)                        // 6e67000c
    VST1 [V2.S4, V3.S4, V4.S4, V5.S4], (R14)                    // c229004c
-   VST1.P [V25.S4], (R7)(R29)                                  // VST1.P [V25.S4], (R7)(R29*1)                          // f9789d4c
+   VST1.P [V25.S4], (R7)(R29)                                  // f9789d4c
    VST1.P [V25.D2, V26.D2], 32(R7)                             // f9ac9f4c
-   VST1.P [V14.D1, V15.D1], (R7)(R23)                          // VST1.P [V14.D1, V15.D1], (R7)(R23*1)                  // eeac970c
+   VST1.P [V14.D1, V15.D1], (R7)(R23)                          // eeac970c
    VST1.P [V25.D2, V26.D2, V27.D2], 48(R27)                    // 796f9f4c
-   VST1.P [V13.H8, V14.H8, V15.H8], (R3)(R14)                  // VST1.P [V13.H8, V14.H8, V15.H8], (R3)(R14*1)          // 6d648e4c
+   VST1.P [V13.H8, V14.H8, V15.H8], (R3)(R14)                  // 6d648e4c
    VST1.P [V16.S4, V17.S4, V18.S4, V19.S4], 64(R6)             // d0289f4c
-   VST1.P [V19.H4, V20.H4, V21.H4, V22.H4], (R4)(R16)          // VST1.P [V19.H4, V20.H4, V21.H4, V22.H4], (R4)(R16*1)  // 9324900c
+   VST1.P [V19.H4, V20.H4, V21.H4, V22.H4], (R4)(R16)          // 9324900c
    VST1 V12.B[3], (R1)                                         // 2c0c000d
    VST1 V12.B[3], (R1)                                         // 2c0c000d
    VST1 V25.S[2], (R20)                                        // 9982004d
    VST1 V9.D[1], (RSP)                                         // e987004d
    VST1.P V30.B[6], 1(R3)                                      // 7e189f0d
-   VST1.P V8.B[0], (R3)(R21)                                   // VST1.P V8.B[0], (R3)(R21*1)                          // 6800950d
+   VST1.P V8.B[0], (R3)(R21)                                   // 6800950d
    VST1.P V15.H[5], 2(R10)                                     // 4f499f4d
-   VST1.P V1.H[7], (R23)(R11)                                  // VST1.P V1.H[7], (R23)(R11*1)                         // e15a8b4d
+   VST1.P V1.H[7], (R23)(R11)                                  // e15a8b4d
    VST1.P V26.S[0], 4(R11)                                     // 7a819f0d
-   VST1.P V9.S[1], (R16)(R21)                                  // VST1.P V9.S[1], (R16)(R21*1)                         // 0992950d
+   VST1.P V9.S[1], (R16)(R21)                                  // 0992950d
    VST1.P V16.D[0], 8(R9)                                      // 30859f0d
-   VST1.P V23.D[1], (R21)(R16)                                 // VST1.P V23.D[1], (R21)(R16*1)                        // b786904d
+   VST1.P V23.D[1], (R21)(R16)                                 // b786904d
    VSUB V1, V12, V23                                           // 9785e17e
    VUADDLV V31.S4, V11                                         // eb3bb06e
    UCVTFWS R11, F19                                            // 7301231e

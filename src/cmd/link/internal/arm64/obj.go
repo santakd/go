@@ -45,17 +45,22 @@ func Init() (*sys.Arch, ld.Arch) {
 		Minalign:   minAlign,
 		Dwarfregsp: dwarfRegSP,
 		Dwarfreglr: dwarfRegLR,
+		TrampLimit: 0x7c00000, // 26-bit signed offset * 4, leave room for PLT etc.
 
-		Adddynrel2:       adddynrel2,
+		Adddynrel:        adddynrel,
 		Archinit:         archinit,
 		Archreloc:        archreloc,
 		Archrelocvariant: archrelocvariant,
-		Asmb:             asmb,
-		Asmb2:            asmb2,
+		Extreloc:         extreloc,
 		Elfreloc1:        elfreloc1,
+		ElfrelocSize:     24,
 		Elfsetupplt:      elfsetupplt,
-		Gentext2:         gentext2,
+		Gentext:          gentext,
+		GenSymsLate:      gensymlate,
 		Machoreloc1:      machoreloc1,
+		MachorelocSize:   8,
+		PEreloc1:         pereloc1,
+		Trampoline:       trampoline,
 
 		Androiddynld: "/system/bin/linker64",
 		Linuxdynld:   "/lib/ld-linux-aarch64.so.1",
@@ -101,10 +106,14 @@ func archinit(ctxt *ld.Link) {
 	case objabi.Hdarwin: /* apple MACH */
 		ld.HEADR = ld.INITIAL_MACHO_HEADR
 		if *ld.FlagTextAddr == -1 {
-			*ld.FlagTextAddr = 4096 + int64(ld.HEADR)
+			*ld.FlagTextAddr = 1<<32 + int64(ld.HEADR)
 		}
 		if *ld.FlagRound == -1 {
-			*ld.FlagRound = 4096
+			*ld.FlagRound = 16384 // 16K page alignment
 		}
+
+	case objabi.Hwindows: /* PE executable */
+		// ld.HEADR, ld.FlagTextAddr, ld.FlagRound are set in ld.Peinit
+		return
 	}
 }

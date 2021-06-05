@@ -202,6 +202,108 @@ func TestGcZombieReporting(t *testing.T) {
 	}
 }
 
+func TestGCTestMoveStackOnNextCall(t *testing.T) {
+	t.Parallel()
+	var onStack int
+	// GCTestMoveStackOnNextCall can fail in rare cases if there's
+	// a preemption. This won't happen many times in quick
+	// succession, so just retry a few times.
+	for retry := 0; retry < 5; retry++ {
+		runtime.GCTestMoveStackOnNextCall()
+		if moveStackCheck(t, &onStack, uintptr(unsafe.Pointer(&onStack))) {
+			// Passed.
+			return
+		}
+	}
+	t.Fatal("stack did not move")
+}
+
+// This must not be inlined because the point is to force a stack
+// growth check and move the stack.
+//
+//go:noinline
+func moveStackCheck(t *testing.T, new *int, old uintptr) bool {
+	// new should have been updated by the stack move;
+	// old should not have.
+
+	// Capture new's value before doing anything that could
+	// further move the stack.
+	new2 := uintptr(unsafe.Pointer(new))
+
+	t.Logf("old stack pointer %x, new stack pointer %x", old, new2)
+	if new2 == old {
+		// Check that we didn't screw up the test's escape analysis.
+		if cls := runtime.GCTestPointerClass(unsafe.Pointer(new)); cls != "stack" {
+			t.Fatalf("test bug: new (%#x) should be a stack pointer, not %s", new2, cls)
+		}
+		// This was a real failure.
+		return false
+	}
+	return true
+}
+
+func TestGCTestMoveStackRepeatedly(t *testing.T) {
+	// Move the stack repeatedly to make sure we're not doubling
+	// it each time.
+	for i := 0; i < 100; i++ {
+		runtime.GCTestMoveStackOnNextCall()
+		moveStack1(false)
+	}
+}
+
+//go:noinline
+func moveStack1(x bool) {
+	// Make sure this function doesn't get auto-nosplit.
+	if x {
+		println("x")
+	}
+}
+
+func TestGCTestIsReachable(t *testing.T) {
+	var all, half []unsafe.Pointer
+	var want uint64
+	for i := 0; i < 16; i++ {
+		// The tiny allocator muddies things, so we use a
+		// scannable type.
+		p := unsafe.Pointer(new(*int))
+		all = append(all, p)
+		if i%2 == 0 {
+			half = append(half, p)
+			want |= 1 << i
+		}
+	}
+
+	got := runtime.GCTestIsReachable(all...)
+	if want != got {
+		t.Fatalf("did not get expected reachable set; want %b, got %b", want, got)
+	}
+	runtime.KeepAlive(half)
+}
+
+var pointerClassSink *int
+var pointerClassData = 42
+
+func TestGCTestPointerClass(t *testing.T) {
+	t.Parallel()
+	check := func(p unsafe.Pointer, want string) {
+		t.Helper()
+		got := runtime.GCTestPointerClass(p)
+		if got != want {
+			// Convert the pointer to a uintptr to avoid
+			// escaping it.
+			t.Errorf("for %#x, want class %s, got %s", uintptr(p), want, got)
+		}
+	}
+	var onStack int
+	var notOnStack int
+	pointerClassSink = &notOnStack
+	check(unsafe.Pointer(&onStack), "stack")
+	check(unsafe.Pointer(&notOnStack), "heap")
+	check(unsafe.Pointer(&pointerClassSink), "bss")
+	check(unsafe.Pointer(&pointerClassData), "data")
+	check(nil, "other")
+}
+
 func BenchmarkSetTypePtr(b *testing.B) {
 	benchSetType(b, new(*byte))
 }
@@ -518,7 +620,7 @@ func BenchmarkReadMemStats(b *testing.B) {
 	hugeSink = nil
 }
 
-func BenchmarkReadMemStatsLatency(b *testing.B) {
+func applyGCLoad(b *testing.B) func() {
 	// We’ll apply load to the runtime with maxProcs-1 goroutines
 	// and use one more to actually benchmark. It doesn't make sense
 	// to try to run this test with only 1 P (that's what
@@ -563,6 +665,14 @@ func BenchmarkReadMemStatsLatency(b *testing.B) {
 			runtime.KeepAlive(hold)
 		}()
 	}
+	return func() {
+		close(done)
+		wg.Wait()
+	}
+}
+
+func BenchmarkReadMemStatsLatency(b *testing.B) {
+	stop := applyGCLoad(b)
 
 	// Spend this much time measuring latencies.
 	latencies := make([]time.Duration, 0, 1024)
@@ -579,12 +689,11 @@ func BenchmarkReadMemStatsLatency(b *testing.B) {
 		runtime.ReadMemStats(&ms)
 		latencies = append(latencies, time.Now().Sub(start))
 	}
-	close(done)
-	// Make sure to stop the timer before we wait! The goroutines above
-	// are very heavy-weight and not easy to stop, so we could end up
+	// Make sure to stop the timer before we wait! The load created above
+	// is very heavy-weight and not easy to stop, so we could end up
 	// confusing the benchmarking framework for small b.N.
 	b.StopTimer()
-	wg.Wait()
+	stop()
 
 	// Disable the default */op metrics.
 	// ns/op doesn't mean anything because it's an average, but we
@@ -763,6 +872,10 @@ func BenchmarkScanStackNoLocals(b *testing.B) {
 }
 
 func BenchmarkMSpanCountAlloc(b *testing.B) {
+	// Allocate one dummy mspan for the whole benchmark.
+	s := runtime.AllocMSpan()
+	defer runtime.FreeMSpan(s)
+
 	// n is the number of bytes to benchmark against.
 	// n must always be a multiple of 8, since gcBits is
 	// always rounded up 8 bytes.
@@ -774,7 +887,7 @@ func BenchmarkMSpanCountAlloc(b *testing.B) {
 
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
-				runtime.MSpanCountAlloc(bits)
+				runtime.MSpanCountAlloc(s, bits)
 			}
 		})
 	}

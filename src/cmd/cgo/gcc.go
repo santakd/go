@@ -298,7 +298,7 @@ func (p *Package) guessKinds(f *File) []*Name {
 			continue
 		}
 
-		if goos == "darwin" && strings.HasSuffix(n.C, "Ref") {
+		if (goos == "darwin" || goos == "ios") && strings.HasSuffix(n.C, "Ref") {
 			// For FooRef, find out if FooGetTypeID exists.
 			s := n.C[:len(n.C)-3] + "GetTypeID"
 			n := &Name{Go: s, C: s}
@@ -369,7 +369,18 @@ func (p *Package) guessKinds(f *File) []*Name {
 	fmt.Fprintf(&b, "#line 1 \"completed\"\n"+
 		"int __cgo__1 = __cgo__2;\n")
 
-	stderr := p.gccErrors(b.Bytes())
+	// We need to parse the output from this gcc command, so ensure that it
+	// doesn't have any ANSI escape sequences in it. (TERM=dumb is
+	// insufficient; if the user specifies CGO_CFLAGS=-fdiagnostics-color,
+	// GCC will ignore TERM, and GCC can also be configured at compile-time
+	// to ignore TERM.)
+	stderr := p.gccErrors(b.Bytes(), "-fdiagnostics-color=never")
+	if strings.Contains(stderr, "unrecognized command line option") {
+		// We're using an old version of GCC that doesn't understand
+		// -fdiagnostics-color. Those versions can't print color anyway,
+		// so just rerun without that option.
+		stderr = p.gccErrors(b.Bytes())
+	}
 	if stderr == "" {
 		fatalf("%s produced no output\non input:\n%s", p.gccBaseCmd()[0], b.Bytes())
 	}
@@ -898,7 +909,7 @@ func (p *Package) rewriteCall(f *File, call *Call) (string, bool) {
 	var sbCheck bytes.Buffer
 	for i, param := range params {
 		origArg := args[i]
-		arg, nu := p.mangle(f, &args[i])
+		arg, nu := p.mangle(f, &args[i], true)
 		if nu {
 			needsUnsafe = true
 		}
@@ -941,7 +952,7 @@ func (p *Package) rewriteCall(f *File, call *Call) (string, bool) {
 		sb.WriteString("return ")
 	}
 
-	m, nu := p.mangle(f, &call.Call.Fun)
+	m, nu := p.mangle(f, &call.Call.Fun, false)
 	if nu {
 		needsUnsafe = true
 	}
@@ -1075,7 +1086,8 @@ func (p *Package) hasPointer(f *File, t ast.Expr, top bool) bool {
 // rewriting calls when it finds them.
 // It removes the corresponding references in f.Ref and f.Calls, so that we
 // don't try to do the replacement again in rewriteRef or rewriteCall.
-func (p *Package) mangle(f *File, arg *ast.Expr) (ast.Expr, bool) {
+// If addPosition is true, add position info to the idents of C names in arg.
+func (p *Package) mangle(f *File, arg *ast.Expr, addPosition bool) (ast.Expr, bool) {
 	needsUnsafe := false
 	f.walk(arg, ctxExpr, func(f *File, arg interface{}, context astContext) {
 		px, ok := arg.(*ast.Expr)
@@ -1090,7 +1102,7 @@ func (p *Package) mangle(f *File, arg *ast.Expr) (ast.Expr, bool) {
 
 			for _, r := range f.Ref {
 				if r.Expr == px {
-					*px = p.rewriteName(f, r)
+					*px = p.rewriteName(f, r, addPosition)
 					r.Done = true
 					break
 				}
@@ -1350,11 +1362,11 @@ func (p *Package) rewriteRef(f *File) {
 			}
 		}
 
-		expr := p.rewriteName(f, r)
+		expr := p.rewriteName(f, r, false)
 
 		if *godefs {
 			// Substitute definition for mangled type name.
-			if r.Name.Type != nil {
+			if r.Name.Type != nil && r.Name.Kind == "type" {
 				expr = r.Name.Type.Go
 			}
 			if id, ok := expr.(*ast.Ident); ok {
@@ -1413,8 +1425,23 @@ func (p *Package) rewriteRef(f *File) {
 }
 
 // rewriteName returns the expression used to rewrite a reference.
-func (p *Package) rewriteName(f *File, r *Ref) ast.Expr {
-	var expr ast.Expr = ast.NewIdent(r.Name.Mangle) // default
+// If addPosition is true, add position info in the ident name.
+func (p *Package) rewriteName(f *File, r *Ref, addPosition bool) ast.Expr {
+	getNewIdent := ast.NewIdent
+	if addPosition {
+		getNewIdent = func(newName string) *ast.Ident {
+			mangledIdent := ast.NewIdent(newName)
+			if len(newName) == len(r.Name.Go) {
+				return mangledIdent
+			}
+			p := fset.Position((*r.Expr).End())
+			if p.Column == 0 {
+				return mangledIdent
+			}
+			return ast.NewIdent(fmt.Sprintf("%s /*line :%d:%d*/", newName, p.Line, p.Column))
+		}
+	}
+	var expr ast.Expr = getNewIdent(r.Name.Mangle) // default
 	switch r.Context {
 	case ctxCall, ctxCall2:
 		if r.Name.Kind != "func" {
@@ -1442,7 +1469,7 @@ func (p *Package) rewriteName(f *File, r *Ref) ast.Expr {
 				n.Mangle = "_C2func_" + n.Go
 				f.Name["2"+r.Name.Go] = n
 			}
-			expr = ast.NewIdent(n.Mangle)
+			expr = getNewIdent(n.Mangle)
 			r.Name = n
 			break
 		}
@@ -1473,7 +1500,7 @@ func (p *Package) rewriteName(f *File, r *Ref) ast.Expr {
 			// issue 7757.
 			expr = &ast.CallExpr{
 				Fun:  &ast.Ident{NamePos: (*r.Expr).Pos(), Name: "_Cgo_ptr"},
-				Args: []ast.Expr{ast.NewIdent(name.Mangle)},
+				Args: []ast.Expr{getNewIdent(name.Mangle)},
 			}
 		case "type":
 			// Okay - might be new(T)
@@ -1538,7 +1565,14 @@ func (p *Package) gccBaseCmd() []string {
 func (p *Package) gccMachine() []string {
 	switch goarch {
 	case "amd64":
+		if goos == "darwin" {
+			return []string{"-arch", "x86_64", "-m64"}
+		}
 		return []string{"-m64"}
+	case "arm64":
+		if goos == "darwin" {
+			return []string{"-arch", "arm64"}
+		}
 	case "386":
 		return []string{"-m32"}
 	case "arm":
@@ -1548,9 +1582,17 @@ func (p *Package) gccMachine() []string {
 	case "s390x":
 		return []string{"-m64"}
 	case "mips64", "mips64le":
-		return []string{"-mabi=64"}
+		if gomips64 == "hardfloat" {
+			return []string{"-mabi=64", "-mhard-float"}
+		} else if gomips64 == "softfloat" {
+			return []string{"-mabi=64", "-msoft-float"}
+		}
 	case "mips", "mipsle":
-		return []string{"-mabi=32"}
+		if gomips == "hardfloat" {
+			return []string{"-mabi=32", "-mfp32", "-mhard-float", "-mno-odd-spreg"}
+		} else if gomips == "softfloat" {
+			return []string{"-mabi=32", "-msoft-float"}
+		}
 	}
 	return nil
 }
@@ -1596,6 +1638,8 @@ func (p *Package) gccCmd() []string {
 		c = append(c, "-maix64")
 		c = append(c, "-mcmodel=large")
 	}
+	// disable LTO so we get an object whose symbols we can read
+	c = append(c, "-fno-lto")
 	c = append(c, "-") //read input from standard input
 	return c
 }
@@ -1970,22 +2014,25 @@ func (p *Package) gccDefines(stdin []byte) string {
 // gccErrors runs gcc over the C program stdin and returns
 // the errors that gcc prints. That is, this function expects
 // gcc to fail.
-func (p *Package) gccErrors(stdin []byte) string {
+func (p *Package) gccErrors(stdin []byte, extraArgs ...string) string {
 	// TODO(rsc): require failure
 	args := p.gccCmd()
 
 	// Optimization options can confuse the error messages; remove them.
-	nargs := make([]string, 0, len(args))
+	nargs := make([]string, 0, len(args)+len(extraArgs))
 	for _, arg := range args {
 		if !strings.HasPrefix(arg, "-O") {
 			nargs = append(nargs, arg)
 		}
 	}
 
-	// Force -O0 optimization but keep the trailing "-" at the end.
-	nargs = append(nargs, "-O0")
-	nl := len(nargs)
-	nargs[nl-2], nargs[nl-1] = nargs[nl-1], nargs[nl-2]
+	// Force -O0 optimization and append extra arguments, but keep the
+	// trailing "-" at the end.
+	li := len(nargs) - 1
+	last := nargs[li]
+	nargs[li] = "-O0"
+	nargs = append(nargs, extraArgs...)
+	nargs = append(nargs, last)
 
 	if *debugGcc {
 		fmt.Fprintf(os.Stderr, "$ %s <<EOF\n", strings.Join(nargs, " "))
@@ -2434,6 +2481,18 @@ func (c *typeConv) loadType(dtype dwarf.Type, pos token.Pos, parent string) *Typ
 			tt := *t
 			tt.C = &TypeRepr{"%s %s", []interface{}{dt.Kind, tag}}
 			tt.Go = c.Ident("struct{}")
+			if dt.Kind == "struct" {
+				// We don't know what the representation of this struct is, so don't let
+				// anyone allocate one on the Go side. As a side effect of this annotation,
+				// pointers to this type will not be considered pointers in Go. They won't
+				// get writebarrier-ed or adjusted during a stack copy. This should handle
+				// all the cases badPointerTypedef used to handle, but hopefully will
+				// continue to work going forward without any more need for cgo changes.
+				tt.NotInHeap = true
+				// TODO: we should probably do the same for unions. Unions can't live
+				// on the Go heap, right? It currently doesn't work for unions because
+				// they are defined as a type alias for struct{}, not a defined type.
+			}
 			typedef[name.Name] = &tt
 			break
 		}
@@ -2504,6 +2563,7 @@ func (c *typeConv) loadType(dtype dwarf.Type, pos token.Pos, parent string) *Typ
 		}
 		t.Go = name
 		t.BadPointer = sub.BadPointer
+		t.NotInHeap = sub.NotInHeap
 		if unionWithPointer[sub.Go] {
 			unionWithPointer[t.Go] = true
 		}
@@ -2514,6 +2574,7 @@ func (c *typeConv) loadType(dtype dwarf.Type, pos token.Pos, parent string) *Typ
 			tt := *t
 			tt.Go = sub.Go
 			tt.BadPointer = sub.BadPointer
+			tt.NotInHeap = sub.NotInHeap
 			typedef[name.Name] = &tt
 		}
 
@@ -2817,21 +2878,11 @@ func (c *typeConv) Struct(dt *dwarf.StructType, pos token.Pos) (expr *ast.Struct
 		tgo := t.Go
 		size := t.Size
 		talign := t.Align
-		if f.BitSize > 0 {
-			switch f.BitSize {
-			case 8, 16, 32, 64:
-			default:
-				continue
-			}
-			size = f.BitSize / 8
-			name := tgo.(*ast.Ident).String()
-			if strings.HasPrefix(name, "int") {
-				name = "int"
-			} else {
-				name = "uint"
-			}
-			tgo = ast.NewIdent(name + fmt.Sprint(f.BitSize))
-			talign = size
+		if f.BitOffset > 0 || f.BitSize > 0 {
+			// The layout of bitfields is implementation defined,
+			// so we don't know how they correspond to Go fields
+			// even if they are aligned at byte boundaries.
+			continue
 		}
 
 		if talign > 0 && f.ByteOffset%talign != 0 {
@@ -3022,6 +3073,7 @@ func (c *typeConv) anonymousStructTypedef(dt *dwarf.TypedefType) bool {
 // non-pointers in this type.
 // TODO: Currently our best solution is to find these manually and list them as
 // they come up. A better solution is desired.
+// Note: DEPRECATED. There is now a better solution. Search for NotInHeap in this file.
 func (c *typeConv) badPointerTypedef(dt *dwarf.TypedefType) bool {
 	if c.badCFType(dt) {
 		return true
@@ -3056,7 +3108,7 @@ func (c *typeConv) badCFType(dt *dwarf.TypedefType) bool {
 	// We identify the correct set of types as those ending in Ref and for which
 	// there exists a corresponding GetTypeID function.
 	// See comment below for details about the bad pointers.
-	if goos != "darwin" {
+	if goos != "darwin" && goos != "ios" {
 		return false
 	}
 	s := dt.Name

@@ -7,13 +7,15 @@ package runtime_test
 import (
 	"bytes"
 	"fmt"
+	"internal/abi"
 	"internal/syscall/windows/sysdll"
 	"internal/testenv"
-	"io/ioutil"
+	"io"
 	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"strconv"
 	"strings"
@@ -285,99 +287,220 @@ func TestCallbackInAnotherThread(t *testing.T) {
 	}
 }
 
-type cbDLLFunc int // int determines number of callback parameters
-
-func (f cbDLLFunc) stdcallName() string {
-	return fmt.Sprintf("stdcall%d", f)
+type cbFunc struct {
+	goFunc interface{}
 }
 
-func (f cbDLLFunc) cdeclName() string {
-	return fmt.Sprintf("cdecl%d", f)
+func (f cbFunc) cName(cdecl bool) string {
+	name := "stdcall"
+	if cdecl {
+		name = "cdecl"
+	}
+	t := reflect.TypeOf(f.goFunc)
+	for i := 0; i < t.NumIn(); i++ {
+		name += "_" + t.In(i).Name()
+	}
+	return name
 }
 
-func (f cbDLLFunc) buildOne(stdcall bool) string {
-	var funcname, attr string
-	if stdcall {
-		funcname = f.stdcallName()
-		attr = "__stdcall"
-	} else {
-		funcname = f.cdeclName()
+func (f cbFunc) cSrc(w io.Writer, cdecl bool) {
+	// Construct a C function that takes a callback with
+	// f.goFunc's signature, and calls it with integers 1..N.
+	funcname := f.cName(cdecl)
+	attr := "__stdcall"
+	if cdecl {
 		attr = "__cdecl"
 	}
 	typename := "t" + funcname
-	p := make([]string, f)
-	for i := range p {
-		p[i] = "uintptr_t"
+	t := reflect.TypeOf(f.goFunc)
+	cTypes := make([]string, t.NumIn())
+	cArgs := make([]string, t.NumIn())
+	for i := range cTypes {
+		// We included stdint.h, so this works for all sized
+		// integer types, and uint8Pair_t.
+		cTypes[i] = t.In(i).Name() + "_t"
+		if t.In(i).Name() == "uint8Pair" {
+			cArgs[i] = fmt.Sprintf("(uint8Pair_t){%d,1}", i)
+		} else {
+			cArgs[i] = fmt.Sprintf("%d", i+1)
+		}
 	}
-	params := strings.Join(p, ",")
-	for i := range p {
-		p[i] = fmt.Sprintf("%d", i+1)
-	}
-	args := strings.Join(p, ",")
-	return fmt.Sprintf(`
-typedef void %s (*%s)(%s);
-void %s(%s f, uintptr_t n) {
-	uintptr_t i;
-	for(i=0;i<n;i++){
-		f(%s);
-	}
+	fmt.Fprintf(w, `
+typedef uintptr_t %s (*%s)(%s);
+uintptr_t %s(%s f) {
+	return f(%s);
 }
-	`, attr, typename, params, funcname, typename, args)
-}
-
-func (f cbDLLFunc) build() string {
-	return "#include <stdint.h>\n\n" + f.buildOne(false) + f.buildOne(true)
+	`, attr, typename, strings.Join(cTypes, ","), funcname, typename, strings.Join(cArgs, ","))
 }
 
-var cbFuncs = [...]interface{}{
-	2: func(i1, i2 uintptr) uintptr {
-		if i1+i2 != 3 {
-			panic("bad input")
-		}
-		return 0
-	},
-	3: func(i1, i2, i3 uintptr) uintptr {
-		if i1+i2+i3 != 6 {
-			panic("bad input")
-		}
-		return 0
-	},
-	4: func(i1, i2, i3, i4 uintptr) uintptr {
-		if i1+i2+i3+i4 != 10 {
-			panic("bad input")
-		}
-		return 0
-	},
-	5: func(i1, i2, i3, i4, i5 uintptr) uintptr {
-		if i1+i2+i3+i4+i5 != 15 {
-			panic("bad input")
-		}
-		return 0
-	},
-	6: func(i1, i2, i3, i4, i5, i6 uintptr) uintptr {
-		if i1+i2+i3+i4+i5+i6 != 21 {
-			panic("bad input")
-		}
-		return 0
-	},
-	7: func(i1, i2, i3, i4, i5, i6, i7 uintptr) uintptr {
-		if i1+i2+i3+i4+i5+i6+i7 != 28 {
-			panic("bad input")
-		}
-		return 0
-	},
-	8: func(i1, i2, i3, i4, i5, i6, i7, i8 uintptr) uintptr {
-		if i1+i2+i3+i4+i5+i6+i7+i8 != 36 {
-			panic("bad input")
-		}
-		return 0
-	},
-	9: func(i1, i2, i3, i4, i5, i6, i7, i8, i9 uintptr) uintptr {
-		if i1+i2+i3+i4+i5+i6+i7+i8+i9 != 45 {
-			panic("bad input")
-		}
-		return 0
-	},
+func (f cbFunc) testOne(t *testing.T, dll *syscall.DLL, cdecl bool, cb uintptr) {
+	r1, _, _ := dll.MustFindProc(f.cName(cdecl)).Call(cb)
+
+	want := 0
+	for i := 0; i < reflect.TypeOf(f.goFunc).NumIn(); i++ {
+		want += i + 1
+	}
+	if int(r1) != want {
+		t.Errorf("wanted result %d; got %d", want, r1)
+	}
+}
+
+type uint8Pair struct{ x, y uint8 }
+
+var cbFuncs = []cbFunc{
+	{func(i1, i2 uintptr) uintptr {
+		return i1 + i2
+	}},
+	{func(i1, i2, i3 uintptr) uintptr {
+		return i1 + i2 + i3
+	}},
+	{func(i1, i2, i3, i4 uintptr) uintptr {
+		return i1 + i2 + i3 + i4
+	}},
+	{func(i1, i2, i3, i4, i5 uintptr) uintptr {
+		return i1 + i2 + i3 + i4 + i5
+	}},
+	{func(i1, i2, i3, i4, i5, i6 uintptr) uintptr {
+		return i1 + i2 + i3 + i4 + i5 + i6
+	}},
+	{func(i1, i2, i3, i4, i5, i6, i7 uintptr) uintptr {
+		return i1 + i2 + i3 + i4 + i5 + i6 + i7
+	}},
+	{func(i1, i2, i3, i4, i5, i6, i7, i8 uintptr) uintptr {
+		return i1 + i2 + i3 + i4 + i5 + i6 + i7 + i8
+	}},
+	{func(i1, i2, i3, i4, i5, i6, i7, i8, i9 uintptr) uintptr {
+		return i1 + i2 + i3 + i4 + i5 + i6 + i7 + i8 + i9
+	}},
+
+	// Non-uintptr parameters.
+	{func(i1, i2, i3, i4, i5, i6, i7, i8, i9 uint8) uintptr {
+		return uintptr(i1 + i2 + i3 + i4 + i5 + i6 + i7 + i8 + i9)
+	}},
+	{func(i1, i2, i3, i4, i5, i6, i7, i8, i9 uint16) uintptr {
+		return uintptr(i1 + i2 + i3 + i4 + i5 + i6 + i7 + i8 + i9)
+	}},
+	{func(i1, i2, i3, i4, i5, i6, i7, i8, i9 int8) uintptr {
+		return uintptr(i1 + i2 + i3 + i4 + i5 + i6 + i7 + i8 + i9)
+	}},
+	{func(i1 int8, i2 int16, i3 int32, i4, i5 uintptr) uintptr {
+		return uintptr(i1) + uintptr(i2) + uintptr(i3) + i4 + i5
+	}},
+	{func(i1, i2, i3, i4, i5 uint8Pair) uintptr {
+		return uintptr(i1.x + i1.y + i2.x + i2.y + i3.x + i3.y + i4.x + i4.y + i5.x + i5.y)
+	}},
+	{func(i1, i2, i3, i4, i5, i6, i7, i8, i9 uint32) uintptr {
+		runtime.GC()
+		return uintptr(i1 + i2 + i3 + i4 + i5 + i6 + i7 + i8 + i9)
+	}},
+}
+
+//go:registerparams
+func sum2(i1, i2 uintptr) uintptr {
+	return i1 + i2
+}
+
+//go:registerparams
+func sum3(i1, i2, i3 uintptr) uintptr {
+	return i1 + i2 + i3
+}
+
+//go:registerparams
+func sum4(i1, i2, i3, i4 uintptr) uintptr {
+	return i1 + i2 + i3 + i4
+}
+
+//go:registerparams
+func sum5(i1, i2, i3, i4, i5 uintptr) uintptr {
+	return i1 + i2 + i3 + i4 + i5
+}
+
+//go:registerparams
+func sum6(i1, i2, i3, i4, i5, i6 uintptr) uintptr {
+	return i1 + i2 + i3 + i4 + i5 + i6
+}
+
+//go:registerparams
+func sum7(i1, i2, i3, i4, i5, i6, i7 uintptr) uintptr {
+	return i1 + i2 + i3 + i4 + i5 + i6 + i7
+}
+
+//go:registerparams
+func sum8(i1, i2, i3, i4, i5, i6, i7, i8 uintptr) uintptr {
+	return i1 + i2 + i3 + i4 + i5 + i6 + i7 + i8
+}
+
+//go:registerparams
+func sum9(i1, i2, i3, i4, i5, i6, i7, i8, i9 uintptr) uintptr {
+	return i1 + i2 + i3 + i4 + i5 + i6 + i7 + i8 + i9
+}
+
+//go:registerparams
+func sum10(i1, i2, i3, i4, i5, i6, i7, i8, i9, i10 uintptr) uintptr {
+	return i1 + i2 + i3 + i4 + i5 + i6 + i7 + i8 + i9 + i10
+}
+
+//go:registerparams
+func sum9uint8(i1, i2, i3, i4, i5, i6, i7, i8, i9 uint8) uintptr {
+	return uintptr(i1 + i2 + i3 + i4 + i5 + i6 + i7 + i8 + i9)
+}
+
+//go:registerparams
+func sum9uint16(i1, i2, i3, i4, i5, i6, i7, i8, i9 uint16) uintptr {
+	return uintptr(i1 + i2 + i3 + i4 + i5 + i6 + i7 + i8 + i9)
+}
+
+//go:registerparams
+func sum9int8(i1, i2, i3, i4, i5, i6, i7, i8, i9 int8) uintptr {
+	return uintptr(i1 + i2 + i3 + i4 + i5 + i6 + i7 + i8 + i9)
+}
+
+//go:registerparams
+func sum5mix(i1 int8, i2 int16, i3 int32, i4, i5 uintptr) uintptr {
+	return uintptr(i1) + uintptr(i2) + uintptr(i3) + i4 + i5
+}
+
+//go:registerparams
+func sum5andPair(i1, i2, i3, i4, i5 uint8Pair) uintptr {
+	return uintptr(i1.x + i1.y + i2.x + i2.y + i3.x + i3.y + i4.x + i4.y + i5.x + i5.y)
+}
+
+// This test forces a GC. The idea is to have enough arguments
+// that insufficient spill slots allocated (according to the ABI)
+// may cause compiler-generated spills to clobber the return PC.
+// Then, the GC stack scanning will catch that.
+//go:registerparams
+func sum9andGC(i1, i2, i3, i4, i5, i6, i7, i8, i9 uint32) uintptr {
+	runtime.GC()
+	return uintptr(i1 + i2 + i3 + i4 + i5 + i6 + i7 + i8 + i9)
+}
+
+// TODO(register args): Remove this once we switch to using the register
+// calling convention by default, since this is redundant with the existing
+// tests.
+var cbFuncsRegABI = []cbFunc{
+	{sum2},
+	{sum3},
+	{sum4},
+	{sum5},
+	{sum6},
+	{sum7},
+	{sum8},
+	{sum9},
+	{sum10},
+	{sum9uint8},
+	{sum9uint16},
+	{sum9int8},
+	{sum5mix},
+	{sum5andPair},
+	{sum9andGC},
+}
+
+func getCallbackTestFuncs() []cbFunc {
+	if regs := runtime.SetIntArgRegs(-1); regs > 0 {
+		return cbFuncsRegABI
+	}
+	return cbFuncs
 }
 
 type cbDLL struct {
@@ -385,21 +508,26 @@ type cbDLL struct {
 	buildArgs func(out, src string) []string
 }
 
-func (d *cbDLL) buildSrc(t *testing.T, path string) {
+func (d *cbDLL) makeSrc(t *testing.T, path string) {
 	f, err := os.Create(path)
 	if err != nil {
 		t.Fatalf("failed to create source file: %v", err)
 	}
 	defer f.Close()
 
-	for i := 2; i < 10; i++ {
-		fmt.Fprint(f, cbDLLFunc(i).build())
+	fmt.Fprint(f, `
+#include <stdint.h>
+typedef struct { uint8_t x, y; } uint8Pair_t;
+`)
+	for _, cbf := range getCallbackTestFuncs() {
+		cbf.cSrc(f, false)
+		cbf.cSrc(f, true)
 	}
 }
 
 func (d *cbDLL) build(t *testing.T, dir string) string {
 	srcname := d.name + ".c"
-	d.buildSrc(t, filepath.Join(dir, srcname))
+	d.makeSrc(t, filepath.Join(dir, srcname))
 	outname := d.name + ".dll"
 	args := d.buildArgs(outname, srcname)
 	cmd := exec.Command(args[0], args[1:]...)
@@ -426,66 +554,31 @@ var cbDLLs = []cbDLL{
 	},
 }
 
-type cbTest struct {
-	n     int     // number of callback parameters
-	param uintptr // dll function parameter
-}
-
-func (test *cbTest) run(t *testing.T, dllpath string) {
-	dll := syscall.MustLoadDLL(dllpath)
-	defer dll.Release()
-	cb := cbFuncs[test.n]
-	stdcall := syscall.NewCallback(cb)
-	f := cbDLLFunc(test.n)
-	test.runOne(t, dll, f.stdcallName(), stdcall)
-	cdecl := syscall.NewCallbackCDecl(cb)
-	test.runOne(t, dll, f.cdeclName(), cdecl)
-}
-
-func (test *cbTest) runOne(t *testing.T, dll *syscall.DLL, proc string, cb uintptr) {
-	defer func() {
-		if r := recover(); r != nil {
-			t.Errorf("dll call %v(..., %d) failed: %v", proc, test.param, r)
-		}
-	}()
-	dll.MustFindProc(proc).Call(cb, test.param)
-}
-
-var cbTests = []cbTest{
-	{2, 1},
-	{2, 10000},
-	{3, 3},
-	{4, 5},
-	{4, 6},
-	{5, 2},
-	{6, 7},
-	{6, 8},
-	{7, 6},
-	{8, 1},
-	{9, 8},
-	{9, 10000},
-	{3, 4},
-	{5, 3},
-	{7, 7},
-	{8, 2},
-	{9, 9},
-}
-
 func TestStdcallAndCDeclCallbacks(t *testing.T) {
 	if _, err := exec.LookPath("gcc"); err != nil {
 		t.Skip("skipping test: gcc is missing")
 	}
-	tmp, err := ioutil.TempDir("", "TestCDeclCallback")
-	if err != nil {
-		t.Fatal("TempDir failed: ", err)
-	}
-	defer os.RemoveAll(tmp)
+	tmp := t.TempDir()
+
+	oldRegs := runtime.SetIntArgRegs(abi.IntArgRegs)
+	defer runtime.SetIntArgRegs(oldRegs)
 
 	for _, dll := range cbDLLs {
-		dllPath := dll.build(t, tmp)
-		for _, test := range cbTests {
-			test.run(t, dllPath)
-		}
+		t.Run(dll.name, func(t *testing.T) {
+			dllPath := dll.build(t, tmp)
+			dll := syscall.MustLoadDLL(dllPath)
+			defer dll.Release()
+			for _, cbf := range getCallbackTestFuncs() {
+				t.Run(cbf.cName(false), func(t *testing.T) {
+					stdcall := syscall.NewCallback(cbf.goFunc)
+					cbf.testOne(t, dll, false, stdcall)
+				})
+				t.Run(cbf.cName(true), func(t *testing.T) {
+					cdecl := syscall.NewCallbackCDecl(cbf.goFunc)
+					cbf.testOne(t, dll, true, cdecl)
+				})
+			}
+		})
 	}
 }
 
@@ -620,14 +713,10 @@ uintptr_t cfunc(callback f, uintptr_t n) {
    return r;
 }
 `
-	tmpdir, err := ioutil.TempDir("", "TestReturnAfterStackGrowInCallback")
-	if err != nil {
-		t.Fatal("TempDir failed: ", err)
-	}
-	defer os.RemoveAll(tmpdir)
+	tmpdir := t.TempDir()
 
 	srcname := "mydll.c"
-	err = ioutil.WriteFile(filepath.Join(tmpdir, srcname), []byte(src), 0)
+	err := os.WriteFile(filepath.Join(tmpdir, srcname), []byte(src), 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -670,6 +759,51 @@ uintptr_t cfunc(callback f, uintptr_t n) {
 	}
 }
 
+func TestSyscall18(t *testing.T) {
+	if _, err := exec.LookPath("gcc"); err != nil {
+		t.Skip("skipping test: gcc is missing")
+	}
+	if runtime.GOARCH != "amd64" {
+		t.Skipf("skipping test: GOARCH=%s", runtime.GOARCH)
+	}
+
+	const src = `
+#include <stdint.h>
+#include <windows.h>
+
+int cfunc(	int a1, int a2, int a3, int a4, int a5, int a6, int a7, int a8, int a9,
+			int a10, int a11, int a12, int a13, int a14, int a15, int a16, int a17, int a18) {
+	return 1;
+}
+`
+	tmpdir := t.TempDir()
+
+	srcname := "mydll.c"
+	err := os.WriteFile(filepath.Join(tmpdir, srcname), []byte(src), 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	outname := "mydll.dll"
+	cmd := exec.Command("gcc", "-shared", "-s", "-Werror", "-o", outname, srcname)
+	cmd.Dir = tmpdir
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("failed to build dll: %v - %v", err, string(out))
+	}
+	dllpath := filepath.Join(tmpdir, outname)
+
+	dll := syscall.MustLoadDLL(dllpath)
+	defer dll.Release()
+
+	proc := dll.MustFindProc("cfunc")
+
+	// proc.Call() will call Syscall18() internally.
+	r, _, err := proc.Call(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18)
+	if r != 1 {
+		t.Errorf("got %d want 1 (err=%v)", r, err)
+	}
+}
+
 func TestFloatArgs(t *testing.T) {
 	if _, err := exec.LookPath("gcc"); err != nil {
 		t.Skip("skipping test: gcc is missing")
@@ -689,14 +823,10 @@ uintptr_t cfunc(uintptr_t a, double b, float c, double d) {
 	return 0;
 }
 `
-	tmpdir, err := ioutil.TempDir("", "TestFloatArgs")
-	if err != nil {
-		t.Fatal("TempDir failed: ", err)
-	}
-	defer os.RemoveAll(tmpdir)
+	tmpdir := t.TempDir()
 
 	srcname := "mydll.c"
-	err = ioutil.WriteFile(filepath.Join(tmpdir, srcname), []byte(src), 0)
+	err := os.WriteFile(filepath.Join(tmpdir, srcname), []byte(src), 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -751,14 +881,10 @@ double cfuncDouble(uintptr_t a, double b, float c, double d) {
 	return 0;
 }
 `
-	tmpdir, err := ioutil.TempDir("", "TestFloatReturn")
-	if err != nil {
-		t.Fatal("TempDir failed: ", err)
-	}
-	defer os.RemoveAll(tmpdir)
+	tmpdir := t.TempDir()
 
 	srcname := "mydll.c"
-	err = ioutil.WriteFile(filepath.Join(tmpdir, srcname), []byte(src), 0)
+	err := os.WriteFile(filepath.Join(tmpdir, srcname), []byte(src), 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -966,16 +1092,7 @@ func TestDLLPreloadMitigation(t *testing.T) {
 		t.Skip("skipping test: gcc is missing")
 	}
 
-	tmpdir, err := ioutil.TempDir("", "TestDLLPreloadMitigation")
-	if err != nil {
-		t.Fatal("TempDir failed: ", err)
-	}
-	defer func() {
-		err := os.RemoveAll(tmpdir)
-		if err != nil {
-			t.Error(err)
-		}
-	}()
+	tmpdir := t.TempDir()
 
 	dir0, err := os.Getwd()
 	if err != nil {
@@ -987,12 +1104,13 @@ func TestDLLPreloadMitigation(t *testing.T) {
 #include <stdint.h>
 #include <windows.h>
 
-uintptr_t cfunc() {
+uintptr_t cfunc(void) {
    SetLastError(123);
+   return 0;
 }
 `
 	srcname := "nojack.c"
-	err = ioutil.WriteFile(filepath.Join(tmpdir, srcname), []byte(src), 0)
+	err = os.WriteFile(filepath.Join(tmpdir, srcname), []byte(src), 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1052,11 +1170,7 @@ func TestBigStackCallbackSyscall(t *testing.T) {
 		t.Fatal("Abs failed: ", err)
 	}
 
-	tmpdir, err := ioutil.TempDir("", "TestBigStackCallback")
-	if err != nil {
-		t.Fatal("TempDir failed: ", err)
-	}
-	defer os.RemoveAll(tmpdir)
+	tmpdir := t.TempDir()
 
 	outname := "mydll.dll"
 	cmd := exec.Command("gcc", "-shared", "-s", "-Werror", "-o", outname, srcname)
@@ -1161,16 +1275,18 @@ func BenchmarkSyscallToSyscallPing(b *testing.B) {
 	go func() {
 		for i := 0; i < n; i++ {
 			syscall.WaitForSingleObject(event1, syscall.INFINITE)
-			err := setEvent(event2)
-			if err != nil {
-				b.Fatal(err)
+			if err := setEvent(event2); err != nil {
+				b.Errorf("Set event failed: %v", err)
+				return
 			}
 		}
 	}()
 	for i := 0; i < n; i++ {
-		err := setEvent(event1)
-		if err != nil {
+		if err := setEvent(event1); err != nil {
 			b.Fatal(err)
+		}
+		if b.Failed() {
+			break
 		}
 		syscall.WaitForSingleObject(event2, syscall.INFINITE)
 	}
@@ -1199,14 +1315,10 @@ func BenchmarkOsYield(b *testing.B) {
 }
 
 func BenchmarkRunningGoProgram(b *testing.B) {
-	tmpdir, err := ioutil.TempDir("", "BenchmarkRunningGoProgram")
-	if err != nil {
-		b.Fatal(err)
-	}
-	defer os.RemoveAll(tmpdir)
+	tmpdir := b.TempDir()
 
 	src := filepath.Join(tmpdir, "main.go")
-	err = ioutil.WriteFile(src, []byte(benchmarkRunningGoProgram), 0666)
+	err := os.WriteFile(src, []byte(benchmarkRunningGoProgram), 0666)
 	if err != nil {
 		b.Fatal(err)
 	}

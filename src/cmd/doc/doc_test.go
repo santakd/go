@@ -36,8 +36,8 @@ func TestMain(m *testing.M) {
 }
 
 func maybeSkip(t *testing.T) {
-	if runtime.GOOS == "darwin" && runtime.GOARCH == "arm64" {
-		t.Skip("darwin/arm64 does not have a full file tree")
+	if runtime.GOOS == "ios" {
+		t.Skip("iOS does not have a full file tree")
 	}
 }
 
@@ -579,7 +579,7 @@ var tests = []test{
 		[]string{
 			`Comment about exported interface`, // Include comment.
 			`type ExportedInterface interface`, // Interface definition.
-			`Comment before exported method.*\n.*ExportedMethod\(\)` +
+			`Comment before exported method.\n.*//\n.*//	// Code block showing how to use ExportedMethod\n.*//	func DoSomething\(\) error {\n.*//		ExportedMethod\(\)\n.*//		return nil\n.*//	}\n.*//.*\n.*ExportedMethod\(\)` +
 				`.*Comment on line with exported method`,
 			`io.Reader.*Comment on line with embedded Reader`,
 			`error.*Comment on line with embedded error`,
@@ -599,8 +599,7 @@ var tests = []test{
 		[]string{
 			`Comment about exported interface`, // Include comment.
 			`type ExportedInterface interface`, // Interface definition.
-			`Comment before exported method.*\n.*ExportedMethod\(\)` +
-				`.*Comment on line with exported method`,
+			`Comment before exported method.\n.*//\n.*//	// Code block showing how to use ExportedMethod\n.*//	func DoSomething\(\) error {\n.*//		ExportedMethod\(\)\n.*//		return nil\n.*//	}\n.*//.*\n.*ExportedMethod\(\)` + `.*Comment on line with exported method`,
 			`unexportedMethod\(\).*Comment on line with unexported method`,
 			`io.Reader.*Comment on line with embedded Reader`,
 			`error.*Comment on line with embedded error`,
@@ -615,7 +614,7 @@ var tests = []test{
 		"interface method",
 		[]string{p, `ExportedInterface.ExportedMethod`},
 		[]string{
-			`Comment before exported method.*\n.*ExportedMethod\(\)` +
+			`Comment before exported method.\n.*//\n.*//	// Code block showing how to use ExportedMethod\n.*//	func DoSomething\(\) error {\n.*//		ExportedMethod\(\)\n.*//		return nil\n.*//	}\n.*//.*\n.*ExportedMethod\(\)` +
 				`.*Comment on line with exported method`,
 		},
 		[]string{

@@ -138,6 +138,24 @@ func shortcircuitBlock(b *Block) bool {
 	if len(b.Values) != nval+nOtherPhi {
 		return false
 	}
+	if nOtherPhi > 0 {
+		// Check for any phi which is the argument of another phi.
+		// These cases are tricky, as substitutions done by replaceUses
+		// are no longer trivial to do in any ordering. See issue 45175.
+		m := make(map[*Value]bool, 1+nOtherPhi)
+		for _, v := range b.Values {
+			if v.Op == OpPhi {
+				m[v] = true
+			}
+		}
+		for v := range m {
+			for _, a := range v.Args {
+				if a != v && m[a] {
+					return false
+				}
+			}
+		}
+	}
 
 	// Locate index of first const phi arg.
 	cidx := -1
@@ -261,15 +279,17 @@ func shortcircuitBlock(b *Block) bool {
 // and the CFG modifications must not proceed.
 // The returned function assumes that shortcircuitBlock has completed its CFG modifications.
 func shortcircuitPhiPlan(b *Block, ctl *Value, cidx int, ti int64) func(*Value, int) {
-	const go115shortcircuitPhis = true
-	if !go115shortcircuitPhis {
-		return nil
-	}
-
 	// t is the "taken" branch: the successor we always go to when coming in from p.
 	t := b.Succs[ti].b
 	// u is the "untaken" branch: the successor we never go to when coming in from p.
 	u := b.Succs[1^ti].b
+
+	// In the following CFG matching, ensure that b's preds are entirely distinct from b's succs.
+	// This is probably a stronger condition than required, but this happens extremely rarely,
+	// and it makes it easier to avoid getting deceived by pretty ASCII charts. See #44465.
+	if p0, p1 := b.Preds[0].b, b.Preds[1].b; p0 == t || p1 == t || p0 == u || p1 == u {
+		return nil
+	}
 
 	// Look for some common CFG structures
 	// in which the outbound paths from b merge,

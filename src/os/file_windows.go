@@ -26,8 +26,11 @@ type file struct {
 }
 
 // Fd returns the Windows handle referencing the open file.
-// The handle is valid only until f.Close is called or f is garbage collected.
-// On Unix systems this will cause the SetDeadline methods to stop working.
+// If f is closed, the file descriptor becomes invalid.
+// If f is garbage collected, a finalizer may close the file descriptor,
+// making it invalid; see runtime.SetFinalizer for more information on when
+// a finalizer might be run. On Unix systems this will cause the SetDeadline
+// methods to stop working.
 func (file *File) Fd() uintptr {
 	if file == nil {
 		return uintptr(syscall.InvalidHandle)
@@ -165,7 +168,7 @@ func openDir(name string) (file *File, err error) {
 // openFileNolog is the Windows implementation of OpenFile.
 func openFileNolog(name string, flag int, perm FileMode) (*File, error) {
 	if name == "" {
-		return nil, &PathError{"open", name, syscall.ENOENT}
+		return nil, &PathError{Op: "open", Path: name, Err: syscall.ENOENT}
 	}
 	r, errf := openFile(name, flag, perm)
 	if errf == nil {
@@ -175,11 +178,11 @@ func openFileNolog(name string, flag int, perm FileMode) (*File, error) {
 	if errd == nil {
 		if flag&O_WRONLY != 0 || flag&O_RDWR != 0 {
 			r.Close()
-			return nil, &PathError{"open", name, syscall.EISDIR}
+			return nil, &PathError{Op: "open", Path: name, Err: syscall.EISDIR}
 		}
 		return r, nil
 	}
-	return nil, &PathError{"open", name, errf}
+	return nil, &PathError{Op: "open", Path: name, Err: errf}
 }
 
 func (file *file) close() error {
@@ -195,7 +198,7 @@ func (file *file) close() error {
 		if e == poll.ErrFileClosing {
 			e = ErrClosed
 		}
-		err = &PathError{"close", file.name, e}
+		err = &PathError{Op: "close", Path: file.name, Err: e}
 	}
 
 	// no need for a finalizer anymore
@@ -233,7 +236,7 @@ func Truncate(name string, size int64) error {
 func Remove(name string) error {
 	p, e := syscall.UTF16PtrFromString(fixLongPath(name))
 	if e != nil {
-		return &PathError{"remove", name, e}
+		return &PathError{Op: "remove", Path: name, Err: e}
 	}
 
 	// Go file interface forces us to know whether
@@ -264,7 +267,7 @@ func Remove(name string) error {
 			}
 		}
 	}
-	return &PathError{"remove", name, e}
+	return &PathError{Op: "remove", Path: name, Err: e}
 }
 
 func rename(oldname, newname string) error {
@@ -276,10 +279,11 @@ func rename(oldname, newname string) error {
 }
 
 // Pipe returns a connected pair of Files; reads from r return bytes written to w.
-// It returns the files and an error, if any.
+// It returns the files and an error, if any. The Windows handles underlying
+// the returned files are marked as inheritable by child processes.
 func Pipe() (r *File, w *File, err error) {
 	var p [2]syscall.Handle
-	e := syscall.CreatePipe(&p[0], &p[1], nil, 0)
+	e := syscall.Pipe(p[:])
 	if e != nil {
 		return nil, nil, NewSyscallError("pipe", e)
 	}
@@ -323,6 +327,8 @@ func Link(oldname, newname string) error {
 }
 
 // Symlink creates newname as a symbolic link to oldname.
+// On Windows, a symlink to a non-existent oldname creates a file symlink;
+// if oldname is later created as a directory the symlink will not work.
 // If there is an error, it will be of type *LinkError.
 func Symlink(oldname, newname string) error {
 	// '/' does not work in link's content
@@ -361,17 +367,14 @@ func Symlink(oldname, newname string) error {
 		flags |= syscall.SYMBOLIC_LINK_FLAG_DIRECTORY
 	}
 	err = syscall.CreateSymbolicLink(n, o, flags)
-
 	if err != nil {
 		// the unprivileged create flag is unsupported
 		// below Windows 10 (1703, v10.0.14972). retry without it.
 		flags &^= windows.SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE
-
 		err = syscall.CreateSymbolicLink(n, o, flags)
-	}
-
-	if err != nil {
-		return &LinkError{"symlink", oldname, newname, err}
+		if err != nil {
+			return &LinkError{"symlink", oldname, newname, err}
+		}
 	}
 	return nil
 }
@@ -490,7 +493,7 @@ func readlink(path string) (string, error) {
 func Readlink(name string) (string, error) {
 	s, err := readlink(fixLongPath(name))
 	if err != nil {
-		return "", &PathError{"readlink", name, err}
+		return "", &PathError{Op: "readlink", Path: name, Err: err}
 	}
 	return s, nil
 }

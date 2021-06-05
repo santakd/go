@@ -37,7 +37,6 @@
 //      } else {
 //              return 0;
 //      }
-
 TEXT ·Cas(SB), NOSPLIT, $0-17
 	MOV	ptr+0(FP), A0
 	MOVW	old+8(FP), A1
@@ -121,6 +120,12 @@ TEXT ·Store64(SB), NOSPLIT, $0-16
 TEXT ·Casp1(SB), NOSPLIT, $0-25
 	JMP	·Cas64(SB)
 
+TEXT ·Casint32(SB),NOSPLIT,$0-17
+	JMP	·Cas(SB)
+
+TEXT ·Casint64(SB),NOSPLIT,$0-25
+	JMP	·Cas64(SB)
+
 TEXT ·Casuintptr(SB),NOSPLIT,$0-25
 	JMP	·Cas64(SB)
 
@@ -130,14 +135,26 @@ TEXT ·CasRel(SB), NOSPLIT, $0-17
 TEXT ·Loaduintptr(SB),NOSPLIT,$0-16
 	JMP	·Load64(SB)
 
+TEXT ·Storeint32(SB),NOSPLIT,$0-12
+	JMP	·Store(SB)
+
+TEXT ·Storeint64(SB),NOSPLIT,$0-16
+	JMP	·Store64(SB)
+
 TEXT ·Storeuintptr(SB),NOSPLIT,$0-16
 	JMP	·Store64(SB)
 
 TEXT ·Loaduint(SB),NOSPLIT,$0-16
 	JMP ·Loaduintptr(SB)
 
+TEXT ·Loadint32(SB),NOSPLIT,$0-12
+	JMP ·Load(SB)
+
 TEXT ·Loadint64(SB),NOSPLIT,$0-16
-	JMP ·Loaduintptr(SB)
+	JMP ·Load64(SB)
+
+TEXT ·Xaddint32(SB),NOSPLIT,$0-20
+	JMP ·Xadd(SB)
 
 TEXT ·Xaddint64(SB),NOSPLIT,$0-24
 	MOV	ptr+0(FP), A0
@@ -150,6 +167,12 @@ TEXT ·Xaddint64(SB),NOSPLIT,$0-24
 TEXT ·LoadAcq(SB),NOSPLIT|NOFRAME,$0-12
 	JMP	·Load(SB)
 
+TEXT ·LoadAcq64(SB),NOSPLIT|NOFRAME,$0-16
+	JMP	·Load64(SB)
+
+TEXT ·LoadAcquintptr(SB),NOSPLIT|NOFRAME,$0-16
+	JMP	·Load64(SB)
+
 // func Loadp(ptr unsafe.Pointer) unsafe.Pointer
 TEXT ·Loadp(SB),NOSPLIT,$0-16
 	JMP	·Load64(SB)
@@ -160,6 +183,12 @@ TEXT ·StorepNoWB(SB), NOSPLIT, $0-16
 
 TEXT ·StoreRel(SB), NOSPLIT, $0-12
 	JMP	·Store(SB)
+
+TEXT ·StoreRel64(SB), NOSPLIT, $0-16
+	JMP	·Store64(SB)
+
+TEXT ·StoreReluintptr(SB), NOSPLIT, $0-16
+	JMP	·Store64(SB)
 
 // func Xchg(ptr *uint32, new uint32) uint32
 TEXT ·Xchg(SB), NOSPLIT, $0-20
@@ -203,6 +232,14 @@ TEXT ·Xadd64(SB), NOSPLIT, $0-24
 TEXT ·Xadduintptr(SB), NOSPLIT, $0-24
 	JMP	·Xadd64(SB)
 
+// func Xchgint32(ptr *int32, new int32) int32
+TEXT ·Xchgint32(SB), NOSPLIT, $0-20
+	JMP	·Xchg(SB)
+
+// func Xchgint64(ptr *int64, new int64) int64
+TEXT ·Xchgint64(SB), NOSPLIT, $0-24
+	JMP	·Xchg64(SB)
+
 // func Xchguintptr(ptr *uintptr, new uintptr) uintptr
 TEXT ·Xchguintptr(SB), NOSPLIT, $0-24
 	JMP	·Xchg64(SB)
@@ -228,5 +265,19 @@ TEXT ·Or8(SB), NOSPLIT, $0-9
 	AND	$-4, A0
 	SLL	$3, A2
 	SLL	A2, A1
+	AMOORW	A1, (A0), ZERO
+	RET
+
+// func And(ptr *uint32, val uint32)
+TEXT ·And(SB), NOSPLIT, $0-12
+	MOV	ptr+0(FP), A0
+	MOVW	val+8(FP), A1
+	AMOANDW	A1, (A0), ZERO
+	RET
+
+// func Or(ptr *uint32, val uint32)
+TEXT ·Or(SB), NOSPLIT, $0-12
+	MOV	ptr+0(FP), A0
+	MOVW	val+8(FP), A1
 	AMOORW	A1, (A0), ZERO
 	RET

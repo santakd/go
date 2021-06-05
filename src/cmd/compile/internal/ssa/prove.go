@@ -726,6 +726,20 @@ var (
 	}
 )
 
+// cleanup returns the posets to the free list
+func (ft *factsTable) cleanup(f *Func) {
+	for _, po := range []*poset{ft.orderS, ft.orderU} {
+		// Make sure it's empty as it should be. A non-empty poset
+		// might cause errors and miscompilations if reused.
+		if checkEnabled {
+			if err := po.CheckEmpty(); err != nil {
+				f.Fatalf("poset not empty after function %s: %v", f.Name, err)
+			}
+		}
+		f.retPoset(po)
+	}
+}
+
 // prove removes redundant BlockIf branches that can be inferred
 // from previous dominating comparisons.
 //
@@ -778,7 +792,14 @@ func prove(f *Func) {
 				if ft.lens == nil {
 					ft.lens = map[ID]*Value{}
 				}
-				ft.lens[v.Args[0].ID] = v
+				// Set all len Values for the same slice as equal in the poset.
+				// The poset handles transitive relations, so Values related to
+				// any OpSliceLen for this slice will be correctly related to others.
+				if l, ok := ft.lens[v.Args[0].ID]; ok {
+					ft.update(b, v, l, signed, eq)
+				} else {
+					ft.lens[v.Args[0].ID] = v
+				}
 				ft.update(b, v, ft.zero, signed, gt|eq)
 				if v.Args[0].Op == OpSliceMake {
 					if lensVars == nil {
@@ -790,7 +811,12 @@ func prove(f *Func) {
 				if ft.caps == nil {
 					ft.caps = map[ID]*Value{}
 				}
-				ft.caps[v.Args[0].ID] = v
+				// Same as case OpSliceLen above, but for slice cap.
+				if c, ok := ft.caps[v.Args[0].ID]; ok {
+					ft.update(b, v, c, signed, eq)
+				} else {
+					ft.caps[v.Args[0].ID] = v
+				}
 				ft.update(b, v, ft.zero, signed, gt|eq)
 				if v.Args[0].Op == OpSliceMake {
 					if lensVars == nil {
@@ -905,17 +931,7 @@ func prove(f *Func) {
 
 	ft.restore()
 
-	// Return the posets to the free list
-	for _, po := range []*poset{ft.orderS, ft.orderU} {
-		// Make sure it's empty as it should be. A non-empty poset
-		// might cause errors and miscompilations if reused.
-		if checkEnabled {
-			if err := po.CheckEmpty(); err != nil {
-				f.Fatalf("prove poset not empty after function %s: %v", f.Name, err)
-			}
-		}
-		f.retPoset(po)
-	}
+	ft.cleanup(f)
 }
 
 // getBranch returns the range restrictions added by p
@@ -1051,6 +1067,11 @@ func addLocalInductiveFacts(ft *factsTable, b *Block) {
 	//
 	// If all of these conditions are true, then i1 < max and i1 >= min.
 
+	// To ensure this is a loop header node.
+	if len(b.Preds) != 2 {
+		return
+	}
+
 	for _, i1 := range b.Values {
 		if i1.Op != OpPhi {
 			continue
@@ -1077,7 +1098,7 @@ func addLocalInductiveFacts(ft *factsTable, b *Block) {
 			return nil
 		}
 		pred, child := b.Preds[1].b, b
-		for ; pred != nil; pred = uniquePred(pred) {
+		for ; pred != nil; pred, child = uniquePred(pred), pred {
 			if pred.Kind != BlockIf {
 				continue
 			}
@@ -1092,6 +1113,9 @@ func addLocalInductiveFacts(ft *factsTable, b *Block) {
 					continue
 				}
 				br = negative
+			}
+			if br == unknown {
+				continue
 			}
 
 			tr, has := domainRelationTable[control.Op]
@@ -1326,7 +1350,7 @@ func removeBranch(b *Block, branch branch) {
 // isNonNegative reports whether v is known to be greater or equal to zero.
 func isNonNegative(v *Value) bool {
 	if !v.Type.IsInteger() {
-		panic("isNonNegative bad type")
+		v.Fatalf("isNonNegative bad type: %v", v.Type)
 	}
 	// TODO: return true if !v.Type.IsSigned()
 	// SSA isn't type-safe enough to do that now (issue 37753).

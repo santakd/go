@@ -13,13 +13,13 @@ import (
 	"go/parser"
 	"go/token"
 	"go/types"
+	exec "internal/execabs"
 	"io"
-	"io/ioutil"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
+	_ "unsafe" // for go:linkname
 )
 
 // An Importer provides the context for importing packages from source code.
@@ -30,7 +30,7 @@ type Importer struct {
 	packages map[string]*types.Package
 }
 
-// NewImporter returns a new Importer for the given context, file set, and map
+// New returns a new Importer for the given context, file set, and map
 // of packages. The context is used to resolve import paths to package paths,
 // and identifying the files belonging to the package. If the context provides
 // non-nil file system functions, they are used instead of the regular package
@@ -133,7 +133,7 @@ func (p *Importer) ImportFrom(path, srcDir string, mode types.ImportMode) (*type
 			// build.Context's VFS.
 			conf.FakeImportC = true
 		} else {
-			conf.UsesCgo = true
+			setUsesCgo(&conf)
 			file, err := p.cgo(bp)
 			if err != nil {
 				return nil, err
@@ -199,7 +199,7 @@ func (p *Importer) parseFiles(dir string, filenames []string) ([]*ast.File, erro
 }
 
 func (p *Importer) cgo(bp *build.Package) (*ast.File, error) {
-	tmpdir, err := ioutil.TempDir("", "srcimporter")
+	tmpdir, err := os.MkdirTemp("", "srcimporter")
 	if err != nil {
 		return nil, err
 	}
@@ -260,3 +260,6 @@ func (p *Importer) joinPath(elem ...string) string {
 	}
 	return filepath.Join(elem...)
 }
+
+//go:linkname setUsesCgo go/types.srcimporter_setUsesCgo
+func setUsesCgo(conf *types.Config)

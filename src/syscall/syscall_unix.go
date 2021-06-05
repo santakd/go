@@ -2,11 +2,13 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
+//go:build aix || darwin || dragonfly || freebsd || linux || netbsd || openbsd || solaris
 // +build aix darwin dragonfly freebsd linux netbsd openbsd solaris
 
 package syscall
 
 import (
+	"internal/itoa"
 	"internal/oserror"
 	"internal/race"
 	"internal/unsafeheader"
@@ -22,7 +24,7 @@ var (
 )
 
 const (
-	darwin64Bit = runtime.GOOS == "darwin" && sizeofPtr == 8
+	darwin64Bit = (runtime.GOOS == "darwin" || runtime.GOOS == "ios") && sizeofPtr == 8
 	netbsd32Bit = runtime.GOOS == "netbsd" && sizeofPtr == 4
 )
 
@@ -110,7 +112,7 @@ func (m *mmapper) Munmap(data []byte) (err error) {
 // using errors.Is. For example:
 //
 //	_, _, err := syscall.Syscall(...)
-//	if errors.Is(err, os.ErrNotExist) ...
+//	if errors.Is(err, fs.ErrNotExist) ...
 type Errno uintptr
 
 func (e Errno) Error() string {
@@ -120,7 +122,7 @@ func (e Errno) Error() string {
 			return s
 		}
 	}
-	return "errno " + itoa(int(e))
+	return "errno " + itoa.Itoa(int(e))
 }
 
 func (e Errno) Is(target error) bool {
@@ -180,7 +182,7 @@ func (s Signal) String() string {
 			return str
 		}
 	}
-	return "signal " + itoa(int(s))
+	return "signal " + itoa.Itoa(int(s))
 }
 
 func Read(fd int, p []byte) (n int, err error) {

@@ -2,6 +2,7 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
+//go:build !cmd_go_bootstrap
 // +build !cmd_go_bootstrap
 
 // This code is compiled into the real 'go' binary, but it is not
@@ -13,6 +14,7 @@ package web
 
 import (
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"mime"
 	"net/http"
@@ -26,7 +28,7 @@ import (
 	"cmd/internal/browser"
 )
 
-// impatientInsecureHTTPClient is used in -insecure mode,
+// impatientInsecureHTTPClient is used with GOINSECURE,
 // when we're connecting to https servers that might not be there
 // or might be using self-signed certificates.
 var impatientInsecureHTTPClient = &http.Client{
@@ -46,6 +48,13 @@ var securityPreservingHTTPClient = &http.Client{
 		if len(via) > 0 && via[0].URL.Scheme == "https" && req.URL.Scheme != "https" {
 			lastHop := via[len(via)-1].URL
 			return fmt.Errorf("redirected from secure URL %s to insecure URL %s", lastHop, req.URL)
+		}
+
+		// Go's http.DefaultClient allows 10 redirects before returning an error.
+		// The securityPreservingHTTPClient also uses this default policy to avoid
+		// Go command hangs.
+		if len(via) >= 10 {
+			return errors.New("stopped after 10 redirects")
 		}
 		return nil
 	},
@@ -70,6 +79,13 @@ func get(security SecurityMode, url *urlpkg.URL) (*Response, error) {
 			fmt.Fprintf(os.Stderr, "# get %s: %v (%.3fs)\n", url.Redacted(), res.Status, time.Since(start).Seconds())
 		}
 		return res, nil
+	}
+
+	if url.Host == "localhost.localdev" {
+		return nil, fmt.Errorf("no such host localhost.localdev")
+	}
+	if os.Getenv("TESTGONETWORK") == "panic" && !strings.HasPrefix(url.Host, "127.0.0.1") && !strings.HasPrefix(url.Host, "0.0.0.0") {
+		panic("use of network: " + url.String())
 	}
 
 	fetch := func(url *urlpkg.URL) (*urlpkg.URL, *http.Response, error) {

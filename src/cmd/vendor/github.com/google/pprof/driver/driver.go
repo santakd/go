@@ -142,7 +142,7 @@ type ObjTool interface {
 
 	// Disasm disassembles the named object file, starting at
 	// the start address and stopping at (before) the end address.
-	Disasm(file string, start, end uint64) ([]Inst, error)
+	Disasm(file string, start, end uint64, intelSyntax bool) ([]Inst, error)
 }
 
 // An Inst is a single instruction in an assembly listing.
@@ -159,8 +159,8 @@ type ObjFile interface {
 	// Name returns the underlying file name, if available.
 	Name() string
 
-	// Base returns the base address to use when looking up symbols in the file.
-	Base() uint64
+	// ObjAddr returns the objdump address corresponding to a runtime address.
+	ObjAddr(addr uint64) (uint64, error)
 
 	// BuildID returns the GNU build ID of the file, or an empty string.
 	BuildID() string
@@ -269,8 +269,8 @@ func (f *internalObjFile) Symbols(r *regexp.Regexp, addr uint64) ([]*plugin.Sym,
 	return pluginSyms, nil
 }
 
-func (o *internalObjTool) Disasm(file string, start, end uint64) ([]plugin.Inst, error) {
-	insts, err := o.ObjTool.Disasm(file, start, end)
+func (o *internalObjTool) Disasm(file string, start, end uint64, intelSyntax bool) ([]plugin.Inst, error) {
+	insts, err := o.ObjTool.Disasm(file, start, end, intelSyntax)
 	if err != nil {
 		return nil, err
 	}

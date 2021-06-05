@@ -34,11 +34,12 @@ import (
 	"cmd/internal/objabi"
 	"cmd/internal/sys"
 	"cmd/link/internal/ld"
+	"internal/buildcfg"
 )
 
 func Init() (*sys.Arch, ld.Arch) {
 	arch := sys.ArchPPC64
-	if objabi.GOARCH == "ppc64le" {
+	if buildcfg.GOARCH == "ppc64le" {
 		arch = sys.ArchPPC64LE
 	}
 
@@ -48,16 +49,17 @@ func Init() (*sys.Arch, ld.Arch) {
 		Minalign:   minAlign,
 		Dwarfregsp: dwarfRegSP,
 		Dwarfreglr: dwarfRegLR,
+		TrampLimit: 0x1c00000,
 
-		Adddynrel2:       adddynrel2,
+		Adddynrel:        adddynrel,
 		Archinit:         archinit,
 		Archreloc:        archreloc,
 		Archrelocvariant: archrelocvariant,
-		Asmb:             asmb,
-		Asmb2:            asmb2,
+		Extreloc:         extreloc,
 		Elfreloc1:        elfreloc1,
+		ElfrelocSize:     24,
 		Elfsetupplt:      elfsetupplt,
-		Gentext2:         gentext2,
+		Gentext:          gentext,
 		Trampoline:       trampoline,
 		Machoreloc1:      machoreloc1,
 		Xcoffreloc1:      xcoffreloc1,

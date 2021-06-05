@@ -113,7 +113,7 @@ func isEmpty(x uint8) bool {
 
 // A header for a Go map.
 type hmap struct {
-	// Note: the format of the hmap is also encoded in cmd/compile/internal/gc/reflect.go.
+	// Note: the format of the hmap is also encoded in cmd/compile/internal/reflectdata/reflect.go.
 	// Make sure this stays in sync with the compiler's definition.
 	count     int // # live cells == size of map.  Must be first (used by len() builtin)
 	flags     uint8
@@ -159,11 +159,11 @@ type bmap struct {
 }
 
 // A hash iteration structure.
-// If you modify hiter, also change cmd/compile/internal/gc/reflect.go to indicate
+// If you modify hiter, also change cmd/compile/internal/reflectdata/reflect.go to indicate
 // the layout of this structure.
 type hiter struct {
-	key         unsafe.Pointer // Must be in first position.  Write nil to indicate iteration end (see cmd/internal/gc/range.go).
-	elem        unsafe.Pointer // Must be in second position (see cmd/internal/gc/range.go).
+	key         unsafe.Pointer // Must be in first position.  Write nil to indicate iteration end (see cmd/compile/internal/walk/range.go).
+	elem        unsafe.Pointer // Must be in second position (see cmd/compile/internal/walk/range.go).
 	t           *maptype
 	h           *hmap
 	buckets     unsafe.Pointer // bucket ptr at hash_iter initialization time
@@ -470,13 +470,13 @@ func mapaccess2(t *maptype, h *hmap, key unsafe.Pointer) (unsafe.Pointer, bool) 
 	}
 	hash := t.hasher(key, uintptr(h.hash0))
 	m := bucketMask(h.B)
-	b := (*bmap)(unsafe.Pointer(uintptr(h.buckets) + (hash&m)*uintptr(t.bucketsize)))
+	b := (*bmap)(add(h.buckets, (hash&m)*uintptr(t.bucketsize)))
 	if c := h.oldbuckets; c != nil {
 		if !h.sameSizeGrow() {
 			// There used to be half as many buckets; mask down one more power of two.
 			m >>= 1
 		}
-		oldb := (*bmap)(unsafe.Pointer(uintptr(c) + (hash&m)*uintptr(t.bucketsize)))
+		oldb := (*bmap)(add(c, (hash&m)*uintptr(t.bucketsize)))
 		if !evacuated(oldb) {
 			b = oldb
 		}
@@ -514,13 +514,13 @@ func mapaccessK(t *maptype, h *hmap, key unsafe.Pointer) (unsafe.Pointer, unsafe
 	}
 	hash := t.hasher(key, uintptr(h.hash0))
 	m := bucketMask(h.B)
-	b := (*bmap)(unsafe.Pointer(uintptr(h.buckets) + (hash&m)*uintptr(t.bucketsize)))
+	b := (*bmap)(add(h.buckets, (hash&m)*uintptr(t.bucketsize)))
 	if c := h.oldbuckets; c != nil {
 		if !h.sameSizeGrow() {
 			// There used to be half as many buckets; mask down one more power of two.
 			m >>= 1
 		}
-		oldb := (*bmap)(unsafe.Pointer(uintptr(c) + (hash&m)*uintptr(t.bucketsize)))
+		oldb := (*bmap)(add(c, (hash&m)*uintptr(t.bucketsize)))
 		if !evacuated(oldb) {
 			b = oldb
 		}
@@ -599,7 +599,7 @@ again:
 	if h.growing() {
 		growWork(t, h, bucket)
 	}
-	b := (*bmap)(unsafe.Pointer(uintptr(h.buckets) + bucket*uintptr(t.bucketsize)))
+	b := (*bmap)(add(h.buckets, bucket*uintptr(t.bucketsize)))
 	top := tophash(hash)
 
 	var inserti *uint8
@@ -650,7 +650,7 @@ bucketloop:
 	}
 
 	if inserti == nil {
-		// all current buckets are full, allocate a new one.
+		// The current bucket and all the overflow buckets connected to it are full, allocate a new one.
 		newb := h.newoverflow(t, b)
 		inserti = &newb.tophash[0]
 		insertk = add(unsafe.Pointer(newb), dataOffset)
@@ -780,6 +780,11 @@ search:
 			}
 		notLast:
 			h.count--
+			// Reset the hash seed to make it more difficult for attackers to
+			// repeatedly trigger hash collisions. See issue 25237.
+			if h.count == 0 {
+				h.hash0 = fastrand()
+			}
 			break search
 		}
 	}
@@ -805,7 +810,7 @@ func mapiterinit(t *maptype, h *hmap, it *hiter) {
 	}
 
 	if unsafe.Sizeof(hiter{})/sys.PtrSize != 12 {
-		throw("hash_iter size incorrect") // see cmd/compile/internal/gc/reflect.go
+		throw("hash_iter size incorrect") // see cmd/compile/internal/reflectdata/reflect.go
 	}
 	it.t = t
 	it.h = h
@@ -992,6 +997,10 @@ func mapclear(t *maptype, h *hmap) {
 	h.nevacuate = 0
 	h.noverflow = 0
 	h.count = 0
+
+	// Reset the hash seed to make it more difficult for attackers to
+	// repeatedly trigger hash collisions. See issue 25237.
+	h.hash0 = fastrand()
 
 	// Keep the mapextra allocation but clear any extra information.
 	if h.extra != nil {
@@ -1371,5 +1380,5 @@ func reflectlite_maplen(h *hmap) int {
 	return h.count
 }
 
-const maxZero = 1024 // must match value in cmd/compile/internal/gc/walk.go:zeroValSize
+const maxZero = 1024 // must match value in reflect/value.go:maxZero cmd/compile/internal/gc/walk.go:zeroValSize
 var zeroVal [maxZero]byte

@@ -307,7 +307,7 @@ func InitSmallSliceLiteral() []int {
 }
 
 func InitNotSmallSliceLiteral() []int {
-	// amd64:`MOVQ\t.*autotmp_`
+	// amd64:`LEAQ\t.*stmp_`
 	return []int{
 		42,
 		42,
@@ -346,4 +346,25 @@ func InitNotSmallSliceLiteral() []int {
 		42,
 		42,
 	}
+}
+
+// --------------------------------------- //
+//   Test PPC64 SUBFCconst folding rules   //
+//   triggered by slice operations.        //
+// --------------------------------------- //
+
+func SliceWithConstCompare(a []int, b int) []int {
+	var c []int = []int{1, 2, 3, 4, 5}
+	if b+len(a) < len(c) {
+		// ppc64le:-"NEG"
+		// ppc64:-"NEG"
+		return c[b:]
+	}
+	return a
+}
+
+func SliceWithSubtractBound(a []int, b int) []int {
+	// ppc64le:"SUBC",-"NEG"
+	// ppc64:"SUBC",-"NEG"
+	return a[(3 - b):]
 }

@@ -18,9 +18,7 @@ setlocal
 
 set GOBUILDFAIL=0
 
-:: we disallow local import for non-local packages, if %GOROOT% happens
-:: to be under %GOPATH%, then some tests below will fail
-set GOPATH=
+set GOPATH=c:\nonexist-gopath
 :: Issue 14340: ignore GOBIN during all.bat.
 set GOBIN=
 set GOFLAGS=
@@ -34,11 +32,6 @@ echo ##### Building packages and commands.
 if errorlevel 1 goto fail
 echo.
 :norebuild
-
-:: we must unset GOROOT_FINAL before tests, because runtime/debug requires
-:: correct access to source code, so if we have GOROOT_FINAL in effect,
-:: at least runtime/debug test will fail.
-set GOROOT_FINAL=
 
 :: get CGO_ENABLED
 ..\bin\go env > env.bat

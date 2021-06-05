@@ -122,9 +122,9 @@ func init() {
 	)
 
 	var WasmOps = []opData{
-		{name: "LoweredStaticCall", argLength: 1, reg: regInfo{clobbers: callerSave}, aux: "SymOff", call: true, symEffect: "None"},            // call static function aux.(*obj.LSym). arg0=mem, auxint=argsize, returns mem
-		{name: "LoweredClosureCall", argLength: 3, reg: regInfo{inputs: []regMask{gp, gp, 0}, clobbers: callerSave}, aux: "Int64", call: true}, // call function via closure. arg0=codeptr, arg1=closure, arg2=mem, auxint=argsize, returns mem
-		{name: "LoweredInterCall", argLength: 2, reg: regInfo{inputs: []regMask{gp}, clobbers: callerSave}, aux: "Int64", call: true},          // call fn by pointer. arg0=codeptr, arg1=mem, auxint=argsize, returns mem
+		{name: "LoweredStaticCall", argLength: 1, reg: regInfo{clobbers: callerSave}, aux: "CallOff", call: true},                                // call static function aux.(*obj.LSym). arg0=mem, auxint=argsize, returns mem
+		{name: "LoweredClosureCall", argLength: 3, reg: regInfo{inputs: []regMask{gp, gp, 0}, clobbers: callerSave}, aux: "CallOff", call: true}, // call function via closure. arg0=codeptr, arg1=closure, arg2=mem, auxint=argsize, returns mem
+		{name: "LoweredInterCall", argLength: 2, reg: regInfo{inputs: []regMask{gp}, clobbers: callerSave}, aux: "CallOff", call: true},          // call fn by pointer. arg0=codeptr, arg1=mem, auxint=argsize, returns mem
 
 		{name: "LoweredAddr", argLength: 1, reg: gp11, aux: "SymOff", rematerializeable: true, symEffect: "Addr"}, // returns base+aux+auxint, arg0=base
 		{name: "LoweredMove", argLength: 3, reg: regInfo{inputs: []regMask{gp, gp}}, aux: "Int64"},                // large move. arg0=dst, arg1=src, arg2=mem, auxint=len/8, returns mem
@@ -137,7 +137,7 @@ func init() {
 		{name: "LoweredWB", argLength: 3, reg: regInfo{inputs: []regMask{gp, gp}}, aux: "Sym", symEffect: "None"},          // invokes runtime.gcWriteBarrier. arg0=destptr, arg1=srcptr, arg2=mem, aux=runtime.gcWriteBarrier
 
 		// LoweredConvert converts between pointers and integers.
-		// We have a special op for this so as to not confuse GC
+		// We have a special op for this so as to not confuse GCCallOff
 		// (particularly stack maps). It takes a memory arg so it
 		// gets correctly ordered with respect to GC safepoints.
 		// arg0=ptr/int arg1=mem, output=int/ptr
@@ -238,13 +238,13 @@ func init() {
 		{name: "I64Extend16S", asm: "I64Extend16S", argLength: 1, reg: gp11, typ: "Int64"}, // sign-extend arg0 from 16 to 64 bit
 		{name: "I64Extend32S", asm: "I64Extend32S", argLength: 1, reg: gp11, typ: "Int64"}, // sign-extend arg0 from 32 to 64 bit
 
-		{name: "F32Sqrt", asm: "F32Sqrt", argLength: 1, reg: fp64_11, typ: "Float32"},         // sqrt(arg0)
-		{name: "F32Trunc", asm: "F32Trunc", argLength: 1, reg: fp64_11, typ: "Float32"},       // trunc(arg0)
-		{name: "F32Ceil", asm: "F32Ceil", argLength: 1, reg: fp64_11, typ: "Float32"},         // ceil(arg0)
-		{name: "F32Floor", asm: "F32Floor", argLength: 1, reg: fp64_11, typ: "Float32"},       // floor(arg0)
-		{name: "F32Nearest", asm: "F32Nearest", argLength: 1, reg: fp64_11, typ: "Float32"},   // round(arg0)
-		{name: "F32Abs", asm: "F32Abs", argLength: 1, reg: fp64_11, typ: "Float32"},           // abs(arg0)
-		{name: "F32Copysign", asm: "F32Copysign", argLength: 2, reg: fp64_21, typ: "Float32"}, // copysign(arg0, arg1)
+		{name: "F32Sqrt", asm: "F32Sqrt", argLength: 1, reg: fp32_11, typ: "Float32"},         // sqrt(arg0)
+		{name: "F32Trunc", asm: "F32Trunc", argLength: 1, reg: fp32_11, typ: "Float32"},       // trunc(arg0)
+		{name: "F32Ceil", asm: "F32Ceil", argLength: 1, reg: fp32_11, typ: "Float32"},         // ceil(arg0)
+		{name: "F32Floor", asm: "F32Floor", argLength: 1, reg: fp32_11, typ: "Float32"},       // floor(arg0)
+		{name: "F32Nearest", asm: "F32Nearest", argLength: 1, reg: fp32_11, typ: "Float32"},   // round(arg0)
+		{name: "F32Abs", asm: "F32Abs", argLength: 1, reg: fp32_11, typ: "Float32"},           // abs(arg0)
+		{name: "F32Copysign", asm: "F32Copysign", argLength: 2, reg: fp32_21, typ: "Float32"}, // copysign(arg0, arg1)
 
 		{name: "F64Sqrt", asm: "F64Sqrt", argLength: 1, reg: fp64_11, typ: "Float64"},         // sqrt(arg0)
 		{name: "F64Trunc", asm: "F64Trunc", argLength: 1, reg: fp64_11, typ: "Float64"},       // trunc(arg0)

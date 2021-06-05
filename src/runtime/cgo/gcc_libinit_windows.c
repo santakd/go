@@ -3,7 +3,8 @@
 // license that can be found in the LICENSE file.
 
 // +build cgo
-#define WIN64_LEAN_AND_MEAN
+
+#define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <process.h>
 
